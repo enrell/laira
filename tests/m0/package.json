@@ -1,0 +1,7 @@
+{
+  "name": "laira-m0-tests",
+  "private": true,
+  "type": "module",
+  "description": "M0 verification scripts — run with the SFU up: node sigtest.mjs && node rtptest.mjs",
+  "dependencies": { "ws": "^8" }
+}

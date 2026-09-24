@@ -1,0 +1,22 @@
+[package]
+name = "laira-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+laira-protocol = { path = "../../crates/protocol" }
+laira-media = { path = "../../crates/media" }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+ashpd = "0.11"
+
+[[bin]]
+name = "laira-desktop"
+path = "src/main.rs"

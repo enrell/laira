@@ -1,0 +1,14 @@
+{
+  "name": "laira-sfu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "mediasoup SFU with WS signaling, plain-RTP ingest for native clients",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "mediasoup": "^3.27.1",
+    "ws": "^8.21.3"
+  }
+}

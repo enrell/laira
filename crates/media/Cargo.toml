@@ -1,0 +1,17 @@
+[package]
+name = "laira-media"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+laira-protocol = { path = "../protocol" }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pipewire = "0.10"
+libspa = "0.10"
+libc = "0.2"
+aes-gcm = "0.11.1"
+hkdf = "0.13.0"
+sha2 = "0.11.0"

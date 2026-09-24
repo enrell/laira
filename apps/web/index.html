@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>laira — M0 viewer</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: #111418; color: #e6e9ee; }
+    header { display: flex; gap: 12px; align-items: center; padding: 10px 16px; background: #1a1e24; border-bottom: 1px solid #2a3038; }
+    header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    button { background: #2b6cb0; color: #fff; border: 0; border-radius: 6px; padding: 7px 14px; font: inherit; cursor: pointer; }
+    button[disabled] { opacity: .45; cursor: default; }
+    button.secondary { background: #2a3038; }
+    #status { margin-left: auto; font-size: 12px; color: #9aa4b0; }
+    #videos { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 12px; padding: 16px; }
+    .stream { background: #000; border-radius: 8px; overflow: hidden; position: relative; }
+    .stream video { width: 100%; display: block; }
+    .stream .label { position: absolute; top: 8px; left: 8px; background: #000a; padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+    .stream .stats { position: absolute; bottom: 8px; left: 8px; background: #000a; padding: 3px 8px; border-radius: 4px; font-size: 11px; color: #9fe6a0; font-family: ui-monospace, monospace; }
+    #log { padding: 0 16px 16px; font-family: ui-monospace, monospace; font-size: 11px; color: #8b95a1; white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>laira M0</h1>
+    <button id="watch" disabled>Watch</button>
+    <button id="mic" disabled>Mic: off</button>
+    <button id="mute" class="secondary" disabled>Mute</button>
+    <span id="status">connecting…</span>
+  </header>
+  <div id="videos"></div>
+  <div id="log"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
