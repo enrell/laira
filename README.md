@@ -27,6 +27,10 @@ server that relays your media can never see it.
   group and their viewers stop within seconds.
 - **Membership-gated SFU**: peers must present a short-lived, admin-signed
   session token.
+- **End-to-end encrypted chat and files** (desktop CLI and browser): channels
+  created by moderators, messages sealed with a per-epoch key and signed by the
+  sender, files encrypted in 64 KiB authenticated chunks with a per-file key
+  that only travels inside the chat message. The relay stores ciphertext only.
 - **Admin recovery**: guardians chosen at community creation can replace a
   lost admin by threshold signature (2-of-3 by default); clients and the SFU
   verify the recovery chain against the genesis, and the old admin is locked out.
@@ -96,6 +100,9 @@ target/debug/laira-desktop stream --e2ee   # portal picker appears
 target/debug/laira-control invite --dir ./community --web http://<sfu-host>:4443
 ```
 
+Chat from the terminal: `laira-desktop chat channels|create <name>|send <channel> <text>|read <channel> [--follow]|send-file <channel> <path>|save-file <channel> <seq>`.
+The browser page shows the same channels with an attach button.
+
 Desktop members join with
 `laira-desktop join --control <url> invite.json` (create the JSON with
 `laira-control invite` without `--web`). `laira-desktop whoami` shows your
@@ -130,6 +137,8 @@ tests/m2/e2e.sh                            # membership + native E2EE + live rek
 tests/m2/recovery.sh                       # 2-of-3 admin recovery, SFU follows the chain
 tests/web/run.sh                           # headless Chromium joins by invite, decodes E2EE video + audio
 tests/web/mic.sh                           # browser microphone -> another browser, E2EE
+tests/m2/chat.sh                           # chat + files: permissions, ciphertext-only relay, tamper, revocation
+tests/web/chat.sh                          # browser <-> desktop chat and file transfer
 node tests/m1/sframe-interop.mjs           # Rust ↔ WebCrypto SFrame vector
 ```
 
@@ -140,8 +149,9 @@ gotchas are in [docs/dev-notes.md](docs/dev-notes.md).
 ## Roadmap
 
 Following [PLAN.md](PLAN.md): M0 ✅ vertical proof · M1 ✅ E2EE media · **M2
-(private entry) mostly done** — remaining: OpenMLS, dead-drop transport · M3 SFU/controller failover · M4 chat, channels, roles · M5
-cooperative file transfer · M6 packaging and daily use.
+(private entry) mostly done** — remaining: OpenMLS, dead-drop transport · M3 SFU/controller failover (not started) · M4 chat and channels (basic: no DMs, search, unread state or fine-grained
+permissions yet) · M5 file sharing via the relay (no peer-to-peer/cooperative
+cache yet) · M6 packaging and daily use.
 
 ## Contributing
 

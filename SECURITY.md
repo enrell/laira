@@ -54,12 +54,19 @@ surprises.
   resolved out of band. Guardians must persist what they signed and never sign
   two recoveries extending the same head. A community created without
   guardians has **no recovery**: losing `admin.json` loses it.
+- **Chat history follows epochs.** A member can read messages from the epochs
+  in which they were in the roster; someone who joins later cannot read earlier
+  messages (the UI says so), and a removed member keeps what they already
+  fetched. Deleting or editing messages is not implemented.
 - **Revocation is not instantaneous.** A removed member keeps the old epoch
   secret they already hold (forward secrecy for *future* media only), and an
   existing SFU connection lasts until its session token expires (5 minutes).
   Native viewers stop on the next epoch poll (about 3 seconds).
 - **The SFU and control service see metadata**: IP addresses, who is
-  connected, packet sizes and timing, RTP headers, and roster membership.
+  connected, packet sizes and timing, RTP headers, roster membership, channel
+  names, who posted in which channel and when, message sizes, and file sizes.
+  Messages and files are ciphertext; the relay keeps chat for the last 10,000
+  messages per channel and files for 7 days (1 GiB quota).
   laira does not provide anonymity.
 - **Browser E2EE trusts the code you are served.** A malicious web host can
   ship JavaScript that leaks keys. The browser stores its identity seed in

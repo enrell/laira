@@ -19,6 +19,16 @@
     .stream video { width: 100%; display: block; }
     .stream .label { position: absolute; top: 8px; left: 8px; background: #000a; padding: 3px 8px; border-radius: 4px; font-size: 12px; }
     .stream .stats { position: absolute; bottom: 8px; left: 8px; background: #000a; padding: 3px 8px; border-radius: 4px; font-size: 11px; color: #9fe6a0; font-family: ui-monospace, monospace; }
+    #chat { margin: 12px 16px 0; background: #1a1e24; border: 1px solid #2a3038; border-radius: 8px; }
+    .chat-head { display: flex; gap: 8px; padding: 8px; border-bottom: 1px solid #2a3038; }
+    .chat-head select { background: #111418; color: inherit; border: 1px solid #2a3038; border-radius: 6px; padding: 5px 8px; font: inherit; }
+    #messages { max-height: 220px; overflow-y: auto; padding: 8px 12px; font-size: 13px; }
+    #messages .m { margin: 2px 0; } #messages .who { color: #7fb2ff; font-family: ui-monospace, monospace; font-size: 11px; margin-right: 6px; }
+    #messages .bad { color: #9aa4b0; font-style: italic; }
+    .attach { background: #2a3038; border-radius: 6px; padding: 7px 10px; cursor: pointer; }
+    #messages a.file { color: #9fe6a0; cursor: pointer; text-decoration: underline; }
+    #chatform { display: flex; gap: 8px; padding: 8px; border-top: 1px solid #2a3038; }
+    #chatform input { flex: 1; background: #111418; color: inherit; border: 1px solid #2a3038; border-radius: 6px; padding: 7px 10px; font: inherit; }
     #log { padding: 0 16px 16px; font-family: ui-monospace, monospace; font-size: 11px; color: #8b95a1; white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
   </style>
 </head>
@@ -30,6 +40,14 @@
     <button id="mute" class="secondary" disabled>Mute</button>
     <span id="status">connecting…</span>
   </header>
+  <section id="chat" hidden>
+    <div class="chat-head">
+      <select id="channel"></select>
+      <button id="newchan" class="secondary">New channel</button>
+    </div>
+    <div id="messages" aria-live="polite"></div>
+    <form id="chatform"><label class="attach secondary" title="Share a file (end-to-end encrypted)">📎<input id="fileinput" type="file" hidden /></label><input id="chatinput" autocomplete="off" placeholder="Message (end-to-end encrypted)" maxlength="4000" /><button>Send</button></form>
+  </section>
   <div id="videos"></div>
   <div id="log"></div>
   <script type="module" src="/src/main.ts"></script>

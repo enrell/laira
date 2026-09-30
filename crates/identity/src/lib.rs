@@ -70,6 +70,10 @@ pub enum Error {
     RecoveryOutOfOrder,
     #[error("conflicting recoveries: chain frozen")]
     RecoveryFork,
+    #[error("message too large")]
+    MessageTooLarge,
+    #[error("channel error: {0}")]
+    Channel(&'static str),
     #[error("not the admin authority")]
     NotAdmin,
 }
@@ -391,6 +395,8 @@ pub struct Authority {
     latest_epoch: Option<EpochBundle>,
     chain: RecoveryChain,
     recoveries: Vec<AdminRecovery>,
+    channels: Vec<Channel>,
+    epoch_history: Vec<EpochBundle>,
 }
 
 /// Serializable authority state (the admin's identity seed is stored
@@ -415,6 +421,10 @@ pub struct AuthoritySnapshot {
     latest_epoch: Option<EpochBundle>,
     #[serde(default)]
     recoveries: Vec<AdminRecovery>,
+    #[serde(default)]
+    channels: Vec<Channel>,
+    #[serde(default)]
+    epoch_history: Vec<EpochBundle>,
 }
 
 impl AuthoritySnapshot {
@@ -446,6 +456,8 @@ impl Authority {
             kids: self.kids.iter().map(|(k, v)| (*k, *v)).collect(),
             latest_epoch: self.latest_epoch.clone(),
             recoveries: self.recoveries.clone(),
+            channels: self.channels.clone(),
+            epoch_history: self.epoch_history.clone(),
         }
     }
 
@@ -479,6 +491,8 @@ impl Authority {
         }
         let mut a = Self::with_chain(id, snap.genesis, chain);
         a.recoveries = snap.recoveries;
+        a.channels = snap.channels;
+        a.epoch_history = snap.epoch_history;
         a.seq = snap.seq;
         a.epoch = snap.epoch;
         a.invites = snap.invites.into_iter()
@@ -497,6 +511,46 @@ impl Authority {
             c.signature = self.id.sign(&c.body());
             self.members.insert(c.member, c.clone());
         }
+    }
+
+    pub fn epoch_bundle(&self, epoch: u64) -> Option<&EpochBundle> {
+        self.epoch_history.iter().find(|b| b.epoch == epoch)
+    }
+
+    pub fn role_of(&self, m: &PublicKey) -> Option<Role> {
+        if *m == self.chain.admin() { return Some(Role::Moderator); }
+        self.members.get(m).map(|c| c.role)
+    }
+
+    pub fn channels(&self) -> &[Channel] {
+        &self.channels
+    }
+
+    /// Create a channel; only the admin or a moderator may. Ids are derived
+    /// from the name (lowercase ascii, digits, dashes) and must be unique.
+    pub fn create_channel(&mut self, by: &PublicKey, name: &str, now: u64) -> Result<Channel> {
+        self.require_admin()?;
+        if self.role_of(by) != Some(Role::Moderator) {
+            return Err(Error::Channel("only moderators can create channels"));
+        }
+        let id: String = name.trim().to_lowercase().chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        if id.is_empty() || id.len() > 32 || id.starts_with('-') {
+            return Err(Error::Channel("bad channel name"));
+        }
+        if self.channels.iter().any(|c| c.id == id) {
+            return Err(Error::Channel("channel exists"));
+        }
+        if self.channels.len() >= 64 {
+            return Err(Error::Channel("too many channels"));
+        }
+        let mut c = Channel {
+            community_id: self.genesis.community_id(), id, name: name.trim().to_string(),
+            created_by: *by, created_at: now, signature: [0; 64],
+        };
+        c.signature = self.id.sign(&c.body());
+        self.channels.push(c.clone());
+        Ok(c)
     }
 
     pub fn latest_epoch(&self) -> Option<&EpochBundle> {
@@ -576,6 +630,8 @@ impl Authority {
         Self {
             chain,
             recoveries: Vec::new(),
+            channels: Vec::new(),
+            epoch_history: Vec::new(),
             id,
             genesis,
             seq: 0,
@@ -682,6 +738,7 @@ impl Authority {
         let mut b = EpochBundle { community_id: cid, epoch: self.epoch, roster, sealed, signature: [0; 64] };
         b.signature = self.id.sign(&b.body());
         self.latest_epoch = Some(b.clone());
+        self.epoch_history.push(b.clone());
         Ok(b)
     }
 
@@ -924,6 +981,210 @@ impl RecoveryChain {
     }
 }
 
+// -------------------------------------------------------------------- chat
+
+pub const CHAT_MAX_PLAINTEXT: usize = 4000;
+
+/// A channel, created by the admin or a moderator and countersigned by the
+/// current admin so clients can tell the list wasn't tampered with in transit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channel {
+    #[serde(with = "hexser")]
+    pub community_id: CommunityId,
+    /// Stable id, also the crypto context of the channel's key.
+    pub id: String,
+    pub name: String,
+    pub created_by: PublicKey,
+    pub created_at: u64,
+    #[serde(with = "hexser")]
+    pub signature: [u8; 64],
+}
+
+impl Channel {
+    fn body(&self) -> Vec<u8> {
+        Canon::new("laira/channel/v1")
+            .field(&self.community_id)
+            .field(self.id.as_bytes())
+            .field(self.name.as_bytes())
+            .field(&self.created_by.0)
+            .u64(self.created_at)
+            .done()
+    }
+
+    pub fn verify(&self, trust: impl Into<Trust>) -> Result<()> {
+        let t = trust.into();
+        if self.community_id != t.community_id {
+            return Err(Error::WrongCommunity);
+        }
+        t.admin.verify(&self.body(), &self.signature)
+    }
+}
+
+/// An end-to-end encrypted, sender-signed chat message. The relay only ever
+/// sees this: ciphertext, sender key, channel id, epoch and timestamp.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEnvelope {
+    #[serde(with = "hexser")]
+    pub community_id: CommunityId,
+    pub channel: String,
+    /// Epoch whose secret keys this message (readers need that epoch's secret).
+    pub epoch: u64,
+    pub sender: PublicKey,
+    pub ts: u64,
+    #[serde(with = "hexser")]
+    pub nonce: [u8; 12],
+    #[serde(with = "hexvec")]
+    pub ciphertext: Vec<u8>,
+    #[serde(with = "hexser")]
+    pub signature: [u8; 64],
+}
+
+impl ChatEnvelope {
+    fn aad(&self) -> Vec<u8> {
+        Canon::new("laira/chat-aad/v1")
+            .field(&self.community_id)
+            .field(self.channel.as_bytes())
+            .u64(self.epoch)
+            .field(&self.sender.0)
+            .u64(self.ts)
+            .done()
+    }
+
+    fn body(&self) -> Vec<u8> {
+        Canon::new("laira/chat/v1")
+            .field(&self.aad())
+            .field(&self.nonce)
+            .field(&self.ciphertext)
+            .done()
+    }
+
+    fn key(secret: &EpochSecret, channel: &str) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        secret.export("chat-message-key", channel.as_bytes(), &mut k);
+        k
+    }
+
+    pub fn seal(me: &Identity, secret: &EpochSecret, community_id: CommunityId, channel: &str, text: &str, now: u64) -> Result<Self> {
+        if text.len() > CHAT_MAX_PLAINTEXT {
+            return Err(Error::MessageTooLarge);
+        }
+        let mut e = ChatEnvelope {
+            community_id,
+            channel: channel.to_string(),
+            epoch: secret.epoch(),
+            sender: me.public(),
+            ts: now,
+            nonce: rand::random(),
+            ciphertext: vec![],
+            signature: [0; 64],
+        };
+        e.ciphertext = Aes256Gcm::new_from_slice(&Self::key(secret, channel)).expect("len")
+            .encrypt(&e.nonce.into(), Payload { msg: text.as_bytes(), aad: &e.aad() })
+            .map_err(|_| Error::BadSignature)?;
+        e.signature = me.sign(&e.body());
+        Ok(e)
+    }
+
+    /// Check the sender's signature only (what a relay can do without keys).
+    pub fn verify_signature(&self) -> Result<()> {
+        self.sender.verify(&self.body(), &self.signature)
+    }
+
+    /// Verify and decrypt with the secret of `self.epoch`.
+    pub fn open(&self, secret: &EpochSecret) -> Result<String> {
+        self.verify_signature()?;
+        if secret.epoch() != self.epoch {
+            return Err(Error::NotInRoster);
+        }
+        let pt = Aes256Gcm::new_from_slice(&Self::key(secret, &self.channel)).expect("len")
+            .decrypt(&self.nonce.into(), Payload { msg: &self.ciphertext, aad: &self.aad() })
+            .map_err(|_| Error::NotInRoster)?;
+        String::from_utf8(pt).map_err(|_| Error::BadKey)
+    }
+}
+
+// -------------------------------------------------------------------- files
+
+pub const FILE_CHUNK: usize = 64 * 1024;
+pub const FILE_MAX_SIZE: u64 = 64 * 1024 * 1024;
+pub const FILE_PREFIX: &str = "laira-file:v1:";
+
+/// Describes an encrypted file; sent *inside* an E2EE chat message, so the
+/// key reaches exactly the members who can read that message. The relay only
+/// ever stores the opaque encrypted chunks under `id`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub v: u8,
+    /// 128-bit random id (hex), also the storage key on the relay.
+    pub id: String,
+    pub name: String,
+    pub size: u64,
+    pub chunks: u32,
+    /// 256-bit random per-file key (hex).
+    pub key: String,
+}
+
+impl Attachment {
+    /// Encode as chat text.
+    pub fn to_message(&self) -> String {
+        format!("{FILE_PREFIX}{}", serde_json::to_string(self).expect("serializable"))
+    }
+
+    pub fn from_message(text: &str) -> Option<Attachment> {
+        let a: Attachment = serde_json::from_str(text.strip_prefix(FILE_PREFIX)?).ok()?;
+        (a.v == 1 && a.id.len() == 32 && a.key.len() == 64 && a.size <= FILE_MAX_SIZE
+            && a.chunks as u64 == a.size.div_ceil(FILE_CHUNK as u64).max(1)).then_some(a)
+    }
+
+    fn chunk_aad(&self, index: u32, last: bool) -> Vec<u8> {
+        Canon::new("laira/file-chunk/v1").field(self.id.as_bytes()).u64(index as u64).field(&[last as u8]).done()
+    }
+
+    fn cipher(&self) -> Result<Aes256Gcm> {
+        let key = hex::decode(&self.key).map_err(|_| Error::BadKey)?;
+        Aes256Gcm::new_from_slice(&key).map_err(|_| Error::BadKey)
+    }
+
+    fn nonce(index: u32) -> [u8; 12] {
+        let mut n = [0u8; 12];
+        n[8..].copy_from_slice(&index.to_be_bytes());
+        n
+    }
+
+    /// Encrypt a whole file into (attachment, encrypted chunks). The index and
+    /// a last-chunk flag are authenticated, so chunks can't be reordered,
+    /// swapped between files or truncated without detection.
+    pub fn encrypt(name: &str, data: &[u8]) -> Result<(Attachment, Vec<Vec<u8>>)> {
+        if data.len() as u64 > FILE_MAX_SIZE {
+            return Err(Error::MessageTooLarge);
+        }
+        let a = Attachment {
+            v: 1, id: hex::encode(rand::random::<[u8; 16]>()), name: name.chars().take(120).collect(),
+            size: data.len() as u64, chunks: (data.len().div_ceil(FILE_CHUNK)).max(1) as u32,
+            key: hex::encode(rand::random::<[u8; 32]>()),
+        };
+        let cipher = a.cipher()?;
+        let mut out = Vec::with_capacity(a.chunks as usize);
+        for i in 0..a.chunks {
+            let start = i as usize * FILE_CHUNK;
+            let part = &data[start.min(data.len())..(start + FILE_CHUNK).min(data.len())];
+            let ct = cipher.encrypt(&Self::nonce(i).into(), Payload { msg: part, aad: &a.chunk_aad(i, i + 1 == a.chunks) })
+                .map_err(|_| Error::BadKey)?;
+            out.push(ct);
+        }
+        Ok((a, out))
+    }
+
+    pub fn decrypt_chunk(&self, index: u32, ct: &[u8]) -> Result<Vec<u8>> {
+        if index >= self.chunks {
+            return Err(Error::BadKey);
+        }
+        self.cipher()?
+            .decrypt(&Self::nonce(index).into(), Payload { msg: ct, aad: &self.chunk_aad(index, index + 1 == self.chunks) })
+            .map_err(|_| Error::BadSignature)
+    }
+}
+
 // ---------------------------------------------------------- session tokens
 
 /// Member's proof-of-possession request for a session token.
@@ -1139,6 +1400,77 @@ mod tests {
         skip.sign(&gs[0]);
         skip.sign(&gs[1]);
         assert_eq!(chain.apply(&skip), Err(Error::RecoveryOutOfOrder));
+    }
+
+    #[test]
+    fn chat_envelopes_and_channels() {
+        let (mut auth, g) = setup();
+        let admin = Identity::from_seed([1; 32]);
+        let cid = g.community_id();
+        let b = auth.create_invite(1000, 600, 3, Role::Member);
+        let (alice, bob) = (Identity::generate(), Identity::generate());
+        auth.admit(&JoinRequest::new(&alice, &b), 1001).unwrap();
+        auth.admit(&JoinRequest::new(&bob, &b), 1001).unwrap();
+        let e1 = auth.new_epoch().unwrap();
+        // only moderators/admin create channels
+        assert_eq!(auth.create_channel(&alice.public(), "general", 1002).err(), Some(Error::Channel("only moderators can create channels")));
+        let ch = auth.create_channel(&admin.public(), "General Chat", 1002).unwrap();
+        assert_eq!(ch.id, "general-chat");
+        ch.verify(&g).unwrap();
+        assert_eq!(auth.create_channel(&admin.public(), "general chat", 1003).err(), Some(Error::Channel("channel exists")));
+
+        let (sa, _) = e1.open(&g, &alice).unwrap();
+        let (sb, _) = e1.open(&g, &bob).unwrap();
+        let env = ChatEnvelope::seal(&alice, &sa, cid, &ch.id, "hello bob", 1010).unwrap();
+        assert!(!env.ciphertext.windows(5).any(|w| w == b"hello")); // relay sees no plaintext
+        env.verify_signature().unwrap(); // a relay can check authorship without keys
+        assert_eq!(env.open(&sb).unwrap(), "hello bob");
+        // tampering with any signed field is detected
+        let mut moved = env.clone();
+        moved.channel = "other".into();
+        assert!(moved.open(&sb).is_err());
+        let mut forged = env.clone();
+        forged.sender = bob.public();
+        assert!(forged.verify_signature().is_err());
+        // after revoking bob, the next epoch's messages are unreadable to him
+        auth.revoke(bob.public());
+        let e2 = auth.new_epoch().unwrap();
+        let (sa2, _) = e2.open(&g, &alice).unwrap();
+        let later = ChatEnvelope::seal(&alice, &sa2, cid, &ch.id, "bob is gone", 1020).unwrap();
+        assert!(later.open(&sb).is_err());
+        assert_eq!(later.open(&sa2).unwrap(), "bob is gone");
+        // history: alice can still read the old message through the stored bundle
+        let old = auth.epoch_bundle(env.epoch).unwrap();
+        let (s_old, _) = old.open(&g, &alice).unwrap();
+        assert_eq!(env.open(&s_old).unwrap(), "hello bob");
+        assert_eq!(ChatEnvelope::seal(&alice, &sa, cid, &ch.id, &"x".repeat(5000), 1).err(), Some(Error::MessageTooLarge));
+    }
+
+    #[test]
+    fn file_attachments_roundtrip_and_tamper() {
+        let data: Vec<u8> = (0..(FILE_CHUNK * 2 + 123)).map(|i| (i % 251) as u8).collect();
+        let (a, chunks) = Attachment::encrypt("report.bin", &data).unwrap();
+        assert_eq!(a.chunks, 3);
+        assert!(!chunks[0].windows(8).any(|w| w == &data[..8])); // ciphertext
+        let mut back = Vec::new();
+        for (i, c) in chunks.iter().enumerate() { back.extend(a.decrypt_chunk(i as u32, c).unwrap()); }
+        assert_eq!(back, data);
+        // reordering, corruption and cross-file swaps are detected
+        assert!(a.decrypt_chunk(1, &chunks[0]).is_err());
+        let mut bad = chunks[2].clone(); bad[0] ^= 1;
+        assert!(a.decrypt_chunk(2, &bad).is_err());
+        let (b, other) = Attachment::encrypt("other.bin", &data).unwrap();
+        assert!(a.decrypt_chunk(0, &other[0]).is_err());
+        assert_ne!(a.key, b.key);
+        // a truncated download (last chunk treated as a middle one) fails
+        assert!(a.decrypt_chunk(1, &chunks[2]).is_err());
+        // message encoding roundtrips and rejects nonsense
+        assert_eq!(Attachment::from_message(&a.to_message()), Some(a.clone()));
+        assert_eq!(Attachment::from_message("laira-file:v1:{}"), None);
+        assert_eq!(Attachment::from_message("hello"), None);
+        // empty files still have one (empty) authenticated chunk
+        let (e, ec) = Attachment::encrypt("empty", &[]).unwrap();
+        assert_eq!((e.chunks, e.decrypt_chunk(0, &ec[0]).unwrap().len()), (1, 0));
     }
 
     #[test]

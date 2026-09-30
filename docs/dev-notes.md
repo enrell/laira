@@ -163,3 +163,20 @@ rekey on epoch change, browser join. Also implemented: 2-of-3 admin recovery (`R
 single key controller), dead-drop/mailbox discovery
 (the mailbox endpoint exists but nothing uses it yet), audio in the native
 `stream` command has only been exercised through `test-audio`.
+
+## Chat and files (M4/M5, basic)
+
+- `ChatEnvelope` (crates/identity): AES-256-GCM under `export("chat-message-key",
+  channel)` of the epoch secret, AAD binds community/channel/epoch/sender/ts,
+  Ed25519 signature by the sender over the canonical body; the relay verifies
+  authorship (never content), readers verify and decrypt with the secret of the
+  message's epoch (fetched from `/v1/epoch/{n}`, openable only if they were in
+  that epoch's roster).
+- Files: `Attachment` = per-file random key + 64 KiB chunks, AES-256-GCM with
+  the chunk index and a last-chunk flag authenticated (no reorder/truncate/swap).
+  The attachment JSON is sent as the text of a chat message
+  (`laira-file:v1:{...}`), so the key reaches exactly the readers of that
+  message. Relay endpoints: `PUT/GET /v1/blob/{id}/{i}`, first uploader owns the
+  blob, chunks immutable, 1 GiB quota, 7-day TTL.
+- The browser renders messages with `textContent` only; attachment names are
+  sanitized before use as a download name.

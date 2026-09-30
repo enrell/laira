@@ -54,6 +54,9 @@ enum Cmd {
     },
     /// Show this profile's identity, roster slot and current epoch.
     Whoami,
+    /// End-to-end encrypted text chat (channels are created by moderators/admin).
+    #[command(subcommand)]
+    Chat(ChatCmd),
     /// Capture screen + game audio + mic and stream through the SFU.
     Stream(StreamArgs),
     /// E2E check of the Rust RTP path: testsrc2 -> Annex-B -> our packetizer
@@ -88,6 +91,28 @@ enum Cmd {
         /// Write the decoded Annex-B stream to a file instead of ffplay.
         #[arg(long)]
         dump: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChatCmd {
+    /// List channels.
+    Channels,
+    /// Create a channel (moderator/admin only).
+    Create { name: String },
+    /// Send a message.
+    Send { channel: String, text: Vec<String> },
+    /// Encrypt and share a file (up to 64 MiB) in a channel.
+    SendFile { channel: String, path: std::path::PathBuf },
+    /// Download and decrypt the file attached to message SEQ.
+    SaveFile { channel: String, seq: u64, #[arg(long, default_value = ".")] out_dir: std::path::PathBuf },
+    /// Read messages; with --follow keep polling.
+    Read {
+        channel: String,
+        #[arg(long, default_value_t = 0)]
+        after: u64,
+        #[arg(long)]
+        follow: bool,
     },
 }
 
@@ -147,6 +172,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Whoami => whoami().await,
+        Cmd::Chat(c) => chat(c).await,
         Cmd::Stream(args) => { if args.e2ee { init_e2ee().await?; } stream(args).await }
         Cmd::TestVideo { sfu, seconds, e2ee } => { if e2ee { init_e2ee().await?; } test_video(sfu, seconds, e2ee).await }
         Cmd::TestAudio { sfu, seconds, e2ee } => { if e2ee { init_e2ee().await?; } test_audio(sfu, seconds, e2ee).await }
@@ -239,6 +265,45 @@ fn e2ee_encryptor() -> media::sframe::SframeEncryptor {
 
 fn e2ee_decryptor() -> media::sframe::SframeDecryptor {
     E2EE.get().expect("init_e2ee not called").dec.clone()
+}
+
+async fn chat(cmd: ChatCmd) -> Result<()> {
+    let p = profile::Profile::load()?.context("no profile; run `join` or `adopt-admin`")?;
+    match cmd {
+        ChatCmd::Channels => {
+            for c in p.channels().await? {
+                println!("{}\t{}", c.id, c.name);
+            }
+        }
+        ChatCmd::Create { name } => {
+            let c = p.create_channel(&name).await?;
+            println!("created #{}", c.id);
+        }
+        ChatCmd::Send { channel, text } => {
+            let seq = p.send_chat(&channel, &text.join(" ")).await?;
+            println!("sent #{channel} seq {seq}");
+        }
+        ChatCmd::SendFile { channel, path } => {
+            let a = p.send_file(&channel, &path).await?;
+            println!("shared {} ({} bytes, {} chunk(s))", a.name, a.size, a.chunks);
+        }
+        ChatCmd::SaveFile { channel, seq, out_dir } => {
+            println!("saved {}", p.save_file(&channel, seq, &out_dir).await?.display());
+        }
+        ChatCmd::Read { channel, mut after, follow } => loop {
+            for m in p.read_chat(&channel, after).await? {
+                after = after.max(m.seq);
+                let shown = match laira_identity::Attachment::from_message(&m.text) {
+                    Some(a) => format!("[file] {} ({} bytes) - save with: chat save-file {channel} {}", a.name, a.size, m.seq),
+                    None => m.text.clone(),
+                };
+                println!("[{}] {}: {}", m.seq, &hex::encode(m.sender.0)[..8], shown);
+            }
+            if !follow { break }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        },
+    }
+    Ok(())
 }
 
 async fn whoami() -> Result<()> {

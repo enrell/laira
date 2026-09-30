@@ -16,14 +16,14 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post, put},
     Json, Router,
 };
 use clap::{Parser, Subcommand};
 use laira_identity::{
-    AdminRecovery, Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
+    Channel, ChatEnvelope, AdminRecovery, Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
     MembershipCert, PublicKey, Revocation, Role, SessionToken, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -127,7 +127,21 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredMsg {
+    seq: u64,
+    envelope: ChatEnvelope,
+}
+
+const BLOB_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
+const BLOB_TTL_SECS: u64 = 7 * 24 * 3600;
+const BLOB_MAX_CHUNKS: u32 = 1024;
+const CHAT_MAX_PER_CHANNEL: usize = 10_000;
+const CHAT_MAX_SKEW_SECS: u64 = 300;
+
 struct Inner {
+    /// channel id -> messages in arrival order (opaque envelopes only).
+    chat: HashMap<String, Vec<StoredMsg>>,
     auth: Authority,
     dir: PathBuf,
     mailbox: HashMap<String, Vec<(u64, Vec<u8>)>>,
@@ -142,6 +156,27 @@ impl Inner {
         std::fs::write(&tmp, serde_json::to_vec_pretty(&self.auth.snapshot())?)?;
         std::fs::rename(tmp, self.dir.join("state.json"))?;
         Ok(())
+    }
+
+    fn persist_chat(&self) -> Result<()> {
+        let tmp = self.dir.join("chat.json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&self.chat)?)?;
+        std::fs::rename(tmp, self.dir.join("chat.json"))?;
+        Ok(())
+    }
+
+    /// Member behind a valid, unexpired session token (`x-laira-token` header:
+    /// hex of the token JSON). Reads and writes of chat/channels need it.
+    fn member_from(&self, h: &HeaderMap) -> Result<PublicKey, ApiErr> {
+        let raw = h.get("x-laira-token").and_then(|v| v.to_str().ok())
+            .ok_or((StatusCode::UNAUTHORIZED, "session token required".to_string()))?;
+        let tok: SessionToken = hex::decode(raw).ok().and_then(|b| serde_json::from_slice(&b).ok())
+            .ok_or((StatusCode::UNAUTHORIZED, "malformed session token".to_string()))?;
+        tok.verify(self.auth.trust(), now()).map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+        if !self.auth.is_member(&tok.member) {
+            return Err((StatusCode::FORBIDDEN, "not a member".into()));
+        }
+        Ok(tok.member)
     }
 }
 
@@ -176,7 +211,7 @@ fn init(dir: &Path, guardians: Vec<String>, threshold: Option<u8>) -> Result<()>
     let genesis = Genesis::create(&id, guardians.clone(), threshold, now());
     let mut auth = Authority::new(id, genesis.clone())?;
     auth.new_epoch()?; // epoch 1: admin only
-    let inner = Inner { auth, dir: dir.to_path_buf(), mailbox: HashMap::new(), admin_token: String::new() };
+    let inner = Inner { chat: HashMap::new(), auth, dir: dir.to_path_buf(), mailbox: HashMap::new(), admin_token: String::new() };
     inner.persist()?;
     println!("community_id = {}", hex::encode(genesis.community_id()));
     println!("admin_key    = {}", hex::encode(genesis.admin.0));
@@ -230,6 +265,113 @@ async fn join(State(s): State<Shared>, Json(req): Json<JoinRequest>) -> Result<J
 
 async fn recoveries(State(s): State<Shared>) -> Json<Vec<AdminRecovery>> {
     Json(lock(&s).auth.recoveries().to_vec())
+}
+
+async fn epoch_by_number(State(s): State<Shared>, UrlPath(n): UrlPath<u64>) -> Result<Json<EpochBundle>, ApiErr> {
+    lock(&s).auth.epoch_bundle(n).cloned().map(Json).ok_or((StatusCode::NOT_FOUND, "no such epoch".into()))
+}
+
+async fn list_channels(State(s): State<Shared>, h: HeaderMap) -> Result<Json<Vec<Channel>>, ApiErr> {
+    let st = lock(&s);
+    st.member_from(&h)?;
+    Ok(Json(st.auth.channels().to_vec()))
+}
+
+#[derive(Deserialize)]
+struct NewChannel {
+    name: String,
+}
+
+async fn create_channel(State(s): State<Shared>, h: HeaderMap, Json(r): Json<NewChannel>) -> Result<Json<Channel>, ApiErr> {
+    let mut st = lock(&s);
+    let who = st.member_from(&h)?;
+    let c = st.auth.create_channel(&who, &r.name, now()).map_err(err(StatusCode::FORBIDDEN))?;
+    st.persist().map_err(err(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(c))
+}
+
+async fn post_chat(State(s): State<Shared>, UrlPath(channel): UrlPath<String>, h: HeaderMap, Json(env): Json<ChatEnvelope>) -> Result<Json<u64>, ApiErr> {
+    let mut st = lock(&s);
+    let who = st.member_from(&h)?;
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+    if env.sender != who { return Err(bad("sender is not the authenticated member")); }
+    if env.channel != channel || !st.auth.channels().iter().any(|c| c.id == channel) { return Err(bad("unknown channel")); }
+    if env.community_id != st.auth.genesis().community_id() { return Err(bad("wrong community")); }
+    if env.ciphertext.len() > laira_identity::CHAT_MAX_PLAINTEXT + 64 { return Err(bad("message too large")); }
+    if now().abs_diff(env.ts) > CHAT_MAX_SKEW_SECS { return Err(bad("timestamp out of range")); }
+    if st.auth.latest_epoch().map_or(true, |e| env.epoch > e.epoch) { return Err(bad("unknown epoch")); }
+    env.verify_signature().map_err(|e| bad(&e.to_string()))?; // the relay can check authorship, never content
+    let q = st.chat.entry(channel).or_default();
+    let seq = q.last().map_or(1, |m| m.seq + 1);
+    q.push(StoredMsg { seq, envelope: env });
+    if q.len() > CHAT_MAX_PER_CHANNEL { q.remove(0); }
+    st.persist_chat().map_err(err(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(seq))
+}
+
+#[derive(Deserialize)]
+struct After {
+    #[serde(default)]
+    after: u64,
+}
+
+async fn get_chat(State(s): State<Shared>, UrlPath(channel): UrlPath<String>, Query(q): Query<After>, h: HeaderMap) -> Result<Json<Vec<StoredMsg>>, ApiErr> {
+    let st = lock(&s);
+    st.member_from(&h)?;
+    Ok(Json(st.chat.get(&channel).map(|v| v.iter().filter(|m| m.seq > q.after).take(200).cloned().collect()).unwrap_or_default()))
+}
+
+fn valid_blob_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn dir_size(p: &Path) -> u64 {
+    std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| {
+        let m = e.metadata();
+        match m { Ok(m) if m.is_dir() => dir_size(&e.path()), Ok(m) => m.len(), Err(_) => 0 }
+    }).sum()).unwrap_or(0)
+}
+
+/// Delete blobs older than the TTL. Called opportunistically on uploads.
+fn blob_gc(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let old = e.path().join("owner").metadata().and_then(|m| m.modified()).ok()
+            .and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() > BLOB_TTL_SECS);
+        if old { let _ = std::fs::remove_dir_all(e.path()); }
+    }
+}
+
+/// Upload one encrypted chunk. The first uploader owns the blob; chunks are
+/// immutable once written. The relay never sees keys or names.
+async fn blob_put(State(s): State<Shared>, UrlPath((id, index)): UrlPath<(String, u32)>, h: HeaderMap, body: Bytes) -> Result<StatusCode, ApiErr> {
+    let st = lock(&s);
+    let who = st.member_from(&h)?;
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string());
+    if !valid_blob_id(&id) || index >= BLOB_MAX_CHUNKS { return Err(bad("bad blob id or chunk index")); }
+    if body.is_empty() || body.len() > laira_identity::FILE_CHUNK + 16 { return Err(bad("bad chunk size")); }
+    let root = st.dir.join("blobs");
+    let dir = root.join(&id);
+    let io = |e: std::io::Error| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    if !dir.exists() {
+        blob_gc(&root);
+        if dir_size(&root) + body.len() as u64 > BLOB_QUOTA_BYTES { return Err((StatusCode::INSUFFICIENT_STORAGE, "blob quota exceeded".into())); }
+        std::fs::create_dir_all(&dir).map_err(io)?;
+        std::fs::write(dir.join("owner"), hex::encode(who.0)).map_err(io)?;
+    } else if std::fs::read_to_string(dir.join("owner")).map_err(io)? != hex::encode(who.0) {
+        return Err((StatusCode::FORBIDDEN, "not the uploader of this blob".into()));
+    }
+    let path = dir.join(index.to_string());
+    if path.exists() { return Err((StatusCode::CONFLICT, "chunk already stored".into())); }
+    std::fs::write(path, &body).map_err(io)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn blob_get(State(s): State<Shared>, UrlPath((id, index)): UrlPath<(String, u32)>, h: HeaderMap) -> Result<Vec<u8>, ApiErr> {
+    let st = lock(&s);
+    st.member_from(&h)?;
+    if !valid_blob_id(&id) || index >= BLOB_MAX_CHUNKS { return Err((StatusCode::BAD_REQUEST, "bad blob id or chunk index".into())); }
+    std::fs::read(st.dir.join("blobs").join(id).join(index.to_string())).map_err(|_| (StatusCode::NOT_FOUND, "no such chunk".into()))
 }
 
 async fn latest_epoch(State(s): State<Shared>) -> Result<Json<EpochBundle>, ApiErr> {
@@ -317,6 +459,10 @@ fn router(shared: Shared) -> Router {
         .route("/v1/genesis", get(genesis))
         .route("/v1/join", post(join))
         .route("/v1/recoveries", get(recoveries))
+        .route("/v1/epoch/{n}", get(epoch_by_number))
+        .route("/v1/channels", get(list_channels).post(create_channel))
+        .route("/v1/chat/{channel}", get(get_chat).post(post_chat))
+        .route("/v1/blob/{id}/{index}", put(blob_put).get(blob_get))
         .route("/v1/epoch/latest", get(latest_epoch))
         .route("/v1/token", post(token))
         .route("/v1/admin/invite", post(admin_invite))
@@ -376,7 +522,7 @@ async fn main() -> Result<()> {
             let seed = new_id.seed();
             let (auth, epoch) = Authority::recover_from(snap, &r, new_id)?;
             write_secret(&dir.join("admin.json"), &serde_json::to_string(&AdminFile { seed: hex::encode(seed) })?)?;
-            Inner { auth, dir: dir.clone(), mailbox: HashMap::new(), admin_token: String::new() }.persist()?;
+            Inner { chat: HashMap::new(), auth, dir: dir.clone(), mailbox: HashMap::new(), admin_token: String::new() }.persist()?;
             let epoch = Some(epoch);
             println!("recovered: new admin active{}", epoch.map(|e| format!(", epoch {}", e.epoch)).unwrap_or_default());
             Ok(())
@@ -385,7 +531,9 @@ async fn main() -> Result<()> {
             let snap: AuthoritySnapshot = serde_json::from_slice(&std::fs::read(dir.join("state.json")).context("run init first")?)?;
             let auth = Authority::restore(load_identity(&dir)?, snap)?;
             let admin_token = std::fs::read_to_string(dir.join("admin.token"))?.trim().to_string();
-            let shared = Arc::new(Mutex::new(Inner { auth, dir, mailbox: HashMap::new(), admin_token }));
+            let chat = std::fs::read(dir.join("chat.json")).ok()
+                .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let shared = Arc::new(Mutex::new(Inner { chat, auth, dir, mailbox: HashMap::new(), admin_token }));
             let l = tokio::net::TcpListener::bind(&bind).await?;
             tracing::info!(%bind, "control listening");
             axum::serve(l, router(shared)).await?;

@@ -5,7 +5,7 @@
 import { Device } from 'mediasoup-client';
 import type { Transport, Consumer, Producer } from 'mediasoup-client/lib/types';
 import type { RtpCapabilities } from 'mediasoup-client/lib/RtpParameters';
-import { Member, EpochKeys, unhex, type InviteBundle } from './laira';
+import { Member, EpochKeys, unhex, parseAttachment, type InviteBundle } from './laira';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -358,4 +358,87 @@ watchBtn.onclick = async () => {
 micBtn.onclick = () => toggleMic().catch(e => log(`mic error: ${e}`));
 muteBtn.onclick = () => toggleMute().catch(e => log(`mute error: ${e}`));
 
-joinFromHash().catch((e) => log(`join failed: ${e}`)).finally(() => { member ??= loadMember(); connect(); });
+// ---- chat ----
+
+const chatEl = document.getElementById('chat')!;
+const channelSel = document.getElementById('channel') as HTMLSelectElement;
+const messagesEl = document.getElementById('messages')!;
+const chatForm = document.getElementById('chatform') as HTMLFormElement;
+const chatInput = document.getElementById('chatinput') as HTMLInputElement;
+let chatAfter = 0, chatChannel = '';
+
+function addMessage(m: { sender: string; text: string; ok: boolean; ts: number }) {
+  const row = document.createElement('div');
+  row.className = 'm' + (m.ok ? '' : ' bad');
+  const who = document.createElement('span');
+  who.className = 'who'; who.textContent = m.sender.slice(0, 8);
+  const body = document.createElement('span');
+  const att = m.ok ? parseAttachment(m.text) : undefined;
+  if (att) {
+    const a = document.createElement('a');
+    a.className = 'file';
+    a.textContent = `📎 ${att.name} (${att.size} bytes)`; // untrusted name: textContent only
+    a.onclick = async () => {
+      try {
+        const bytes = await member!.downloadFile(att);
+        const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes as BufferSource))].map((x) => x.toString(16).padStart(2, '0')).join('');
+        (window as any).__lastDownload = { name: att.name, size: bytes.length, sha256: digest }; // test hook
+        const url = URL.createObjectURL(new Blob([bytes as BlobPart]));
+        const dl = document.createElement('a');
+        dl.href = url; dl.download = att.name.replace(/[\\/]/g, '_'); dl.click();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+      } catch (e) { log(`download failed: ${e}`); }
+    };
+    body.append(a);
+  } else {
+    body.textContent = m.text; // textContent: messages are untrusted, never HTML
+  }
+  row.append(who, body);
+  messagesEl.append(row);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function refreshChannels() {
+  if (!member) return;
+  const list = await member.channels();
+  const cur = channelSel.value;
+  channelSel.replaceChildren(...list.map((c) => { const o = document.createElement('option'); o.value = c.id; o.textContent = '#' + c.name; return o; }));
+  if (list.some((c) => c.id === cur)) channelSel.value = cur;
+  if (channelSel.value !== chatChannel) { chatChannel = channelSel.value; chatAfter = 0; messagesEl.replaceChildren(); }
+}
+
+async function pollChat() {
+  if (!member || removed || !chatChannel) return;
+  try {
+    for (const m of await member.readChat(chatChannel, chatAfter)) { chatAfter = Math.max(chatAfter, m.seq); addMessage(m); }
+  } catch (e) { if (String(e).includes('403') || String(e).includes('401')) leave('removed from the community'); }
+}
+
+function startChat() {
+  if (!member) return;
+  chatEl.hidden = false;
+  refreshChannels().catch((e) => log(`channels failed: ${e}`));
+  setInterval(() => { refreshChannels().then(pollChat).catch(() => {}); }, 2000);
+  channelSel.onchange = () => { chatChannel = channelSel.value; chatAfter = 0; messagesEl.replaceChildren(); pollChat(); };
+  chatForm.onsubmit = async (ev) => {
+    ev.preventDefault();
+    const text = chatInput.value.trim();
+    if (!text || !chatChannel) return;
+    chatInput.value = '';
+    try { await member!.sendChat(chatChannel, text); await pollChat(); } catch (e) { log(`send failed: ${e}`); }
+  };
+  (document.getElementById('fileinput') as HTMLInputElement).onchange = async (ev) => {
+    const input = ev.target as HTMLInputElement;
+    const f = input.files?.[0];
+    input.value = '';
+    if (!f || !chatChannel) return;
+    try { await member!.sendFile(chatChannel, f); await pollChat(); } catch (e) { log(`file upload failed: ${e}`); }
+  };
+  document.getElementById('newchan')!.onclick = async () => {
+    const name = prompt('Channel name');
+    if (!name) return;
+    try { await member!.createChannel(name); await refreshChannels(); } catch (e) { log(`create channel failed: ${e}`); }
+  };
+}
+
+joinFromHash().catch((e) => log(`join failed: ${e}`)).finally(() => { member ??= loadMember(); connect(); startChat(); });
