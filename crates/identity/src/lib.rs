@@ -397,6 +397,7 @@ pub struct Authority {
     recoveries: Vec<AdminRecovery>,
     channels: Vec<Channel>,
     epoch_history: Vec<EpochBundle>,
+    route: Option<Route>,
 }
 
 /// Serializable authority state (the admin's identity seed is stored
@@ -425,6 +426,8 @@ pub struct AuthoritySnapshot {
     channels: Vec<Channel>,
     #[serde(default)]
     epoch_history: Vec<EpochBundle>,
+    #[serde(default)]
+    route: Option<Route>,
 }
 
 impl AuthoritySnapshot {
@@ -458,6 +461,7 @@ impl Authority {
             recoveries: self.recoveries.clone(),
             channels: self.channels.clone(),
             epoch_history: self.epoch_history.clone(),
+            route: self.route.clone(),
         }
     }
 
@@ -493,6 +497,7 @@ impl Authority {
         a.recoveries = snap.recoveries;
         a.channels = snap.channels;
         a.epoch_history = snap.epoch_history;
+        a.route = snap.route;
         a.seq = snap.seq;
         a.epoch = snap.epoch;
         a.invites = snap.invites.into_iter()
@@ -520,6 +525,24 @@ impl Authority {
     pub fn role_of(&self, m: &PublicKey) -> Option<Role> {
         if *m == self.chain.admin() { return Some(Role::Moderator); }
         self.members.get(m).map(|c| c.role)
+    }
+
+    pub fn route(&self) -> Option<&Route> {
+        self.route.as_ref()
+    }
+
+    /// Publish a new route; the revision always increases.
+    pub fn publish_route(&mut self, sfus: Vec<String>, now: u64) -> Result<Route> {
+        self.require_admin()?;
+        let mut r = Route {
+            community_id: self.genesis.community_id(),
+            revision: self.route.as_ref().map_or(1, |r| r.revision + 1),
+            sfus, issued_at: now, signature: [0; 64],
+        };
+        r.verify_shape()?;
+        r.signature = self.id.sign(&r.body());
+        self.route = Some(r.clone());
+        Ok(r)
     }
 
     pub fn channels(&self) -> &[Channel] {
@@ -632,6 +655,7 @@ impl Authority {
             recoveries: Vec::new(),
             channels: Vec::new(),
             epoch_history: Vec::new(),
+            route: None,
             id,
             genesis,
             seq: 0,
@@ -978,6 +1002,49 @@ impl RecoveryChain {
         self.head = r.head();
         self.generation = r.generation;
         Ok(())
+    }
+}
+
+// -------------------------------------------------------------------- route
+
+/// Admin-signed list of SFU endpoints in preference order (PLAN §9). Clients
+/// only follow a route whose revision they haven't seen superseded, so a
+/// stale or replayed route can't send them back to a retired SFU.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    #[serde(with = "hexser")]
+    pub community_id: CommunityId,
+    pub revision: u64,
+    /// Signaling URLs (`ws://` / `wss://`), most preferred first.
+    pub sfus: Vec<String>,
+    pub issued_at: u64,
+    #[serde(with = "hexser")]
+    pub signature: [u8; 64],
+}
+
+impl Route {
+    fn body(&self) -> Vec<u8> {
+        let mut c = Canon::new("laira/route/v1").field(&self.community_id).u64(self.revision).u64(self.issued_at);
+        for u in &self.sfus {
+            c = c.field(u.as_bytes());
+        }
+        c.done()
+    }
+
+    fn verify_shape(&self) -> Result<()> {
+        if self.sfus.is_empty() || self.sfus.len() > 8 || self.sfus.iter().any(|u| !(u.starts_with("ws://") || u.starts_with("wss://")) || u.len() > 200) {
+            return Err(Error::Channel("bad route endpoints"));
+        }
+        Ok(())
+    }
+
+    pub fn verify(&self, trust: impl Into<Trust>) -> Result<()> {
+        let t = trust.into();
+        if self.community_id != t.community_id {
+            return Err(Error::WrongCommunity);
+        }
+        self.verify_shape()?;
+        t.admin.verify(&self.body(), &self.signature)
     }
 }
 
@@ -1471,6 +1538,22 @@ mod tests {
         // empty files still have one (empty) authenticated chunk
         let (e, ec) = Attachment::encrypt("empty", &[]).unwrap();
         assert_eq!((e.chunks, e.decrypt_chunk(0, &ec[0]).unwrap().len()), (1, 0));
+    }
+
+    #[test]
+    fn signed_routes() {
+        let (mut auth, g) = setup();
+        let r1 = auth.publish_route(vec!["ws://a:4443".into(), "wss://b.example".into()], 1000).unwrap();
+        r1.verify(&g).unwrap();
+        assert_eq!(r1.revision, 1);
+        let r2 = auth.publish_route(vec!["ws://b:4443".into()], 1100).unwrap();
+        assert_eq!(r2.revision, 2);
+        let mut forged = r2.clone();
+        forged.sfus = vec!["ws://evil:4443".into()];
+        assert!(forged.verify(&g).is_err());
+        assert!(auth.publish_route(vec![], 1200).is_err());
+        assert!(auth.publish_route(vec!["http://nope".into()], 1200).is_err());
+        assert_eq!(auth.route().unwrap().revision, 2);
     }
 
     #[test]

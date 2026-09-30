@@ -23,7 +23,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use laira_identity::{
-    Channel, ChatEnvelope, AdminRecovery, Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
+    Route, Channel, ChatEnvelope, AdminRecovery, Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
     MembershipCert, PublicKey, Revocation, Role, SessionToken, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,16 @@ enum Cmd {
         /// Print a browser invite link for this web app URL instead of JSON.
         #[arg(long)]
         web: Option<String>,
+    },
+    /// Publish the signed list of SFUs clients should use, most preferred first.
+    Route {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value = "http://127.0.0.1:4500")]
+        url: String,
+        /// SFU signaling URL (ws:// or wss://). Repeat for failover.
+        #[arg(long = "sfu", required = true)]
+        sfus: Vec<String>,
     },
     /// Revoke a member (hex public key) and rotate the epoch.
     Revoke {
@@ -261,6 +271,23 @@ async fn join(State(s): State<Shared>, Json(req): Json<JoinRequest>) -> Result<J
     };
     st.persist().map_err(err(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(JoinReply { cert, epoch }))
+}
+
+async fn get_route(State(s): State<Shared>) -> Result<Json<Route>, ApiErr> {
+    lock(&s).auth.route().cloned().map(Json).ok_or((StatusCode::NOT_FOUND, "no route published".into()))
+}
+
+#[derive(Deserialize)]
+struct RouteReq {
+    sfus: Vec<String>,
+}
+
+async fn admin_route(State(s): State<Shared>, h: HeaderMap, Json(r): Json<RouteReq>) -> Result<Json<Route>, ApiErr> {
+    let mut st = lock(&s);
+    check_admin(&h, &st)?;
+    let route = st.auth.publish_route(r.sfus, now()).map_err(err(StatusCode::BAD_REQUEST))?;
+    st.persist().map_err(err(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(route))
 }
 
 async fn recoveries(State(s): State<Shared>) -> Json<Vec<AdminRecovery>> {
@@ -459,6 +486,8 @@ fn router(shared: Shared) -> Router {
         .route("/v1/genesis", get(genesis))
         .route("/v1/join", post(join))
         .route("/v1/recoveries", get(recoveries))
+        .route("/v1/route", get(get_route))
+        .route("/v1/admin/route", post(admin_route))
         .route("/v1/epoch/{n}", get(epoch_by_number))
         .route("/v1/channels", get(list_channels).post(create_channel))
         .route("/v1/chat/{channel}", get(get_chat).post(post_chat))
@@ -546,6 +575,11 @@ async fn main() -> Result<()> {
                 Some(w) => println!("{}/#c={}&i={}", w.trim_end_matches('/'), url, hex::encode(v.to_string())),
                 None => println!("{v}"),
             }
+            Ok(())
+        }
+        Cmd::Route { dir, url, sfus } => {
+            let v = admin_call(&dir, &url, "/v1/admin/route", serde_json::json!({ "sfus": sfus })).await?;
+            println!("published route revision {}", v["revision"]);
             Ok(())
         }
         Cmd::Revoke { dir, url, member } => {

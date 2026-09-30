@@ -69,10 +69,23 @@ fn depacketize(pay: &[u8], fu: &mut Option<(u8, Vec<u8>)>, nals: &mut Vec<Vec<u8
 pub fn h264_recv_loop(
     sock: UdpSocket,
     want_ssrc: u32,
+    dec: Option<crate::sframe::SframeDecryptor>,
+    out: impl Write + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    h264_recv_loop_stoppable(sock, want_ssrc, dec, out, Default::default())
+}
+
+/// Same as `h264_recv_loop`, but ends when `stop` is set (used on failover so
+/// the abandoned receive thread does not linger on a dead socket).
+pub fn h264_recv_loop_stoppable(
+    sock: UdpSocket,
+    want_ssrc: u32,
     mut dec: Option<crate::sframe::SframeDecryptor>,
     mut out: impl Write + Send + 'static,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     big_rcvbuf(&sock);
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(300)));
     std::thread::spawn(move || {
         let mut frames: BTreeMap<u32, Frame> = BTreeMap::new();
         let mut fu: Option<(u8, Vec<u8>)> = None;
@@ -81,6 +94,10 @@ pub fn h264_recv_loop(
         loop {
             let n = match sock.recv(&mut buf) {
                 Ok(n) => n,
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) { return }
+                    continue;
+                }
                 Err(_) => return,
             };
             let pkt = &buf[..n];

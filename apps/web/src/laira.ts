@@ -209,6 +209,18 @@ export class Member {
     return out;
   }
 
+  /** Admin-signed SFU list (most preferred first), or [] if none is published. */
+  async route(): Promise<string[]> {
+    const r = await fetch(`${this.control}/v1/route`);
+    if (r.status === 404) return [];
+    if (!r.ok) throw new Error(`route: ${r.status}`);
+    const route: { community_id: string; revision: number; sfus: string[]; issued_at: number; signature: string } = await r.json();
+    const trust = await this.trust();
+    const body = canon('laira/route/v1', unhex(route.community_id), u64(route.revision), u64(route.issued_at), ...route.sfus.map((u) => te.encode(u)));
+    if (route.community_id !== trust.communityId || !ed25519.verify(unhex(route.signature), body, unhex(trust.admin))) throw new Error('route signature invalid');
+    return route.sfus.filter((u) => /^wss?:\/\//.test(u));
+  }
+
   async channels(): Promise<Channel[]> {
     const trust = await this.trust();
     const list: Channel[] = await this.authed('/v1/channels');

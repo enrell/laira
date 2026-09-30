@@ -81,6 +81,10 @@ surprises.
   Each sender uses a 64-bit counter (random 32-bit prefix per process/tab so
   a member's several senders never share a nonce space, plus a 32-bit frame
   counter) and must re-key before 2^32 frames.
+- **Failover trusts the admin's route.** The SFU list is admin-signed and
+  verified, but a compromised admin can point clients at a hostile SFU (which
+  still only sees ciphertext and metadata). There is no automatic controller
+  failover: the control service is a single point of availability.
 - **Test-vector fallback.** If no community profile or `LAIRA_EPOCH_SECRET` is
   configured, the desktop client falls back to a *public* test key and prints
   a warning. That mode provides no confidentiality.

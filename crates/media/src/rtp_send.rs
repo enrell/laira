@@ -42,6 +42,16 @@ impl RtpSender {
         Ok(Self { sock, pt: payload_type, ssrc, seq: 1, t0: Instant::now() })
     }
 
+    /// Point the stream at a new SFU transport (failover). Sequence numbers and
+    /// the timestamp base continue, so the encoder pump keeps running untouched;
+    /// callers restart the RTCP reader on `try_clone_socket`.
+    pub fn retarget(&mut self, ip: &str, port: u16) -> Result<()> {
+        let sock = UdpSocket::bind("0.0.0.0:0").context("bind rtp socket")?;
+        sock.connect(format!("{ip}:{port}")).context("connect rtp socket")?;
+        self.sock = sock;
+        Ok(())
+    }
+
     fn now_ts(&self) -> u32 {
         (self.t0.elapsed().as_secs_f64() * CLOCK as f64) as u32
     }

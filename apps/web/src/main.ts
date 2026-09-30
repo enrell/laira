@@ -27,15 +27,44 @@ const pending = new Map<number, { resolve: (v: any) => void; reject: (e: any) =>
 const eventHandlers = new Map<string, (data: any) => void>();
 let ws: WebSocket;
 
+// SFU failover (PLAN §9): the admin-signed route lists SFUs in preference
+// order. On a lost connection the page moves to the next one and, if it was
+// watching, re-joins and re-consumes everything (transports are per SFU).
+let sfuList: string[] = [];
+let sfuIdx = 0;
+let wantWatching = false;
+let connectedOnce = false;
+
+async function loadRoute() {
+  if (!member) return;
+  try {
+    const urls = await member.route();
+    if (urls.length) { sfuList = urls; log(`sfu route: ${urls.join(', ')}`); }
+  } catch (e) { log(`route unavailable: ${e}`); }
+}
+
+function currentSfuUrl(): string {
+  if (sfuList.length) return sfuList[sfuIdx % sfuList.length];
+  return `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+}
+
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}`);
-  ws.onopen = () => { statusEl.textContent = 'connected'; watchBtn.disabled = false; };
+  const url = currentSfuUrl();
+  ws = new WebSocket(url);
+  let opened = false;
+  ws.onopen = () => {
+    opened = true;
+    statusEl.textContent = 'connected'; watchBtn.disabled = false;
+    if (wantWatching && connectedOnce) resumeAfterFailover(url).catch((e) => log(`resume failed: ${e}`));
+    connectedOnce = true;
+  };
   ws.onclose = () => {
-    statusEl.textContent = 'disconnected — retrying';
+    if (removed) return;
+    statusEl.textContent = 'disconnected — switching sfu';
     for (const p of pending.values()) p.reject(new Error('ws closed'));
     pending.clear();
-    setTimeout(connect, 2000);
+    if (!opened || sfuList.length > 1) sfuIdx++; // unreachable: try the next; lost: move on
+    setTimeout(connect, opened ? 300 : 1000);
   };
   ws.onerror = () => statusEl.textContent = 'ws error';
   ws.onmessage = async (ev) => {
@@ -257,24 +286,55 @@ function detachProducer(producerId: string) {
   log(`producer ${producerId.slice(0, 8)} closed`);
 }
 
-async function watch() {
-  if (!member) throw new Error('no membership — open an invite link first');
-  const first = await member.latestEpoch();
-  pushKeys(first);
-  const { peerId, rtpCapabilities, producers } = await req('join', { token: await member.sessionToken() });
-  const m = member;
-  setInterval(() => {
-    if (removed) return;
-    m.sessionToken().then((token) => req('refreshToken', { token }))
-      .catch((e) => { if (String(e).includes('403')) leave('session refused: removed'); else log(`token refresh failed: ${e}`); });
-  }, TOKEN_REFRESH_MS);
-  startEpochPoller(m, first);
+/** Join the current SFU and consume every producer (used at start and after a failover). */
+async function joinAndConsume(m: Member) {
+  const { peerId, rtpCapabilities, producers } = await req('join', { token: await m.sessionToken() });
   myPeerId = peerId;
-  await device.load({ routerRtpCapabilities: rtpCapabilities as RtpCapabilities });
+  if (!device.loaded) await device.load({ routerRtpCapabilities: rtpCapabilities as RtpCapabilities });
   for (const p of producers) await consume(p);
   eventHandlers.set('newProducer', (p: ProducerInfo) => consume(p).catch(e => log(`consume failed: ${e}`)));
   eventHandlers.set('producerClosed', ({ producerId }: any) => detachProducer(producerId));
+}
+
+async function watch() {
+  if (!member) throw new Error('no membership — open an invite link first');
+  await loadRoute();
+  const first = await member.latestEpoch();
+  pushKeys(first);
+  const m = member;
+  wantWatching = true;
+  // After loading the route the preferred SFU may differ from the one serving
+  // this page; the first join happens on whatever we are connected to.
+  await joinAndConsume(m);
+  setInterval(() => {
+    if (removed) return;
+    m.sessionToken().then((token) => req('refreshToken', { token }))
+      .catch((e) => { if (String(e).includes('403')) leave('session refused: removed'); else if (!String(e).includes('ws closed')) log(`token refresh failed: ${e}`); });
+  }, TOKEN_REFRESH_MS);
+  startEpochPoller(m, first);
   startStats();
+}
+
+async function resumeAfterFailover(url: string) {
+  log(`failover: reconnected to ${url}`);
+  const t0 = performance.now();
+  // Transports, consumers and producers belonged to the dead SFU.
+  for (const c of consumers.values()) { try { c.close(); } catch { /* already gone */ } }
+  consumers.clear(); consuming.clear();
+  for (const e of mediaEls.values()) {
+    for (const st of [e.videoStream, e.audioStream]) for (const t of st.getTracks()) { st.removeTrack(t); }
+  }
+  try { recvTransport?.close(); } catch { /* dead */ }
+  try { sendTransport?.close(); } catch { /* dead */ }
+  recvTransport = undefined; sendTransport = undefined;
+  await joinAndConsume(member!);
+  if (micProducer && micStream) {
+    micProducer = undefined; // old producer died with the SFU
+    await startMicProducer(micStream);
+    log('mic re-published after failover');
+  }
+  (window as any).__failovers = ((window as any).__failovers ?? 0) + 1;
+  log(`failover complete in ${(performance.now() - t0).toFixed(0)} ms`);
 }
 
 // ---- mic ----
@@ -292,6 +352,12 @@ async function toggleMic() {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) { log(`getUserMedia failed: ${e}`); return; }
+  await startMicProducer(micStream);
+  micBtn.textContent = 'Mic: on'; muteBtn.disabled = false;
+  log('mic on');
+}
+
+async function startMicProducer(stream: MediaStream) {
   if (!sendTransport) {
     sendTransport = await makeTransport('send');
     sendTransport.on('produce', async ({ kind, rtpParameters, appData }, cb, errb) => {
@@ -303,10 +369,8 @@ async function toggleMic() {
       } catch (e) { errb(e as Error); }
     });
   }
-  const track = micStream.getAudioTracks()[0];
+  const track = stream.getAudioTracks()[0];
   micProducer = await sendTransport.produce({ track });
-  micBtn.textContent = 'Mic: on'; muteBtn.disabled = false;
-  log('mic on');
 }
 
 let muted = false;

@@ -19,6 +19,7 @@ pub struct Signaling {
     >>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     next_id: Arc<AtomicU64>,
+    closed: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Signaling {
@@ -32,6 +33,7 @@ impl Signaling {
             Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, events) = mpsc::channel(64);
         let pending_task = pending.clone();
+        let (closed_tx, closed) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = read.next().await {
                 let Ok(msg) = serde_json::from_str::<ServerMessage>(&text) else { continue };
@@ -51,12 +53,16 @@ impl Signaling {
                     }
                 }
             }
+            // socket closed or errored: fail every in-flight request and tell watchers
+            pending_task.lock().await.clear();
+            let _ = closed_tx.send(true);
         });
         Ok((
             Self {
                 write: Arc::new(Mutex::new(write)),
                 pending,
                 next_id: Arc::new(AtomicU64::new(1)),
+                closed,
             },
             events,
         ))
@@ -77,6 +83,14 @@ impl Signaling {
                 format!("decoding {method} reply")
             })?),
             Err(e) => bail!("{method}: {e}"),
+        }
+    }
+
+    /// Resolves when the signaling socket closes (SFU gone or network lost).
+    pub async fn wait_closed(&self) {
+        let mut r = self.closed.clone();
+        while !*r.borrow() {
+            if r.changed().await.is_err() { break }
         }
     }
 

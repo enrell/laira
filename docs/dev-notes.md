@@ -180,3 +180,18 @@ single key controller), dead-drop/mailbox discovery
   blob, chunks immutable, 1 GiB quota, 7-day TTL.
 - The browser renders messages with `textContent` only; attachment names are
   sanitized before use as a download name.
+
+## SFU failover (M3, partial)
+
+- `Route` (crates/identity): admin-signed `{revision, sfus[]}`; `GET /v1/route`,
+  `laira-control route`. Clients verify it against the recovery-chain trust.
+- Native: `Signaling::wait_closed` detects a dead socket; `test-video` retargets
+  the running `RtpSender` (`retarget`) to a new PlainTransport on the next SFU,
+  the encoder/packetizer never restart. `watch` reconnects, re-consumes and
+  swaps the receive thread (`h264_recv_loop_stoppable`), keeping the output
+  handle alive. Viewers resync on the next keyframe (<= 2 s GOP).
+- Browser: on close the page moves to the next route entry, re-joins and
+  re-consumes; transports/consumers are per SFU so they are rebuilt.
+- Not done: the real `stream` command (portal capture) does not reconnect,
+  no planned zero-pause migration, no load/RTT-based selection, and the control
+  service itself is not replicated.

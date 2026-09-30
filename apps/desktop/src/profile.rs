@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use laira_identity::{
-    Attachment, FILE_CHUNK, Channel, ChatEnvelope, AdminRecovery, RecoveryChain, Trust, EpochBundle, EpochSecret, Genesis, Identity, InviteBundle, JoinRequest, MembershipCert,
+    Route, Attachment, FILE_CHUNK, Channel, ChatEnvelope, AdminRecovery, RecoveryChain, Trust, EpochBundle, EpochSecret, Genesis, Identity, InviteBundle, JoinRequest, MembershipCert,
     PublicKey, SessionToken, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -185,6 +185,18 @@ impl Profile {
             out.push(ChatLine { seq: m.seq, sender: e.sender, ts: e.ts, text: text.unwrap_or_else(|t| t) });
         }
         Ok(out)
+    }
+
+    /// SFU signaling URLs from the admin-signed route (verified against the
+    /// current trust anchor), or None if no route is published.
+    pub async fn route(&self) -> Result<Option<Route>> {
+        let http = reqwest::Client::new();
+        let r = http.get(format!("{}/v1/route", self.control)).send().await?;
+        if r.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+        anyhow::ensure!(r.status().is_success(), "route: {}", r.status());
+        let route: Route = r.json().await?;
+        route.verify(&self.trust().await?).context("route signature")?;
+        Ok(Some(route))
     }
 
     /// Encrypt `path` chunk by chunk, upload the ciphertext to the relay, then

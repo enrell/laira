@@ -31,6 +31,11 @@ server that relays your media can never see it.
   created by moderators, messages sealed with a per-epoch key and signed by the
   sender, files encrypted in 64 KiB authenticated chunks with a per-file key
   that only travels inside the chat message. The relay stores ciphertext only.
+- **SFU failover**: the admin publishes a signed route listing several SFUs;
+  the native sender and viewer and the browser viewer verify it, and when an
+  SFU dies they move to the next one and resume (measured 1.6 s native, 3.5 s
+  browser, against an 8 s target). The native `stream` command does not fail
+  over yet — only `test-video`, `watch` and the browser do.
 - **Admin recovery**: guardians chosen at community creation can replace a
   lost admin by threshold signature (2-of-3 by default); clients and the SFU
   verify the recovery chain against the genesis, and the old admin is locked out.
@@ -100,6 +105,9 @@ target/debug/laira-desktop stream --e2ee   # portal picker appears
 target/debug/laira-control invite --dir ./community --web http://<sfu-host>:4443
 ```
 
+Publish a failover route with `laira-control route --dir ./community --sfu ws://a:4443 --sfu ws://b:4443`
+(clients then prefer the signed route over `--sfu`).
+
 Chat from the terminal: `laira-desktop chat channels|create <name>|send <channel> <text>|read <channel> [--follow]|send-file <channel> <path>|save-file <channel> <seq>`.
 The browser page shows the same channels with an attach button.
 
@@ -137,6 +145,8 @@ tests/m2/e2e.sh                            # membership + native E2EE + live rek
 tests/m2/recovery.sh                       # 2-of-3 admin recovery, SFU follows the chain
 tests/web/run.sh                           # headless Chromium joins by invite, decodes E2EE video + audio
 tests/web/mic.sh                           # browser microphone -> another browser, E2EE
+tests/m3/failover.sh                       # kill SFU 1: sender + viewer move to SFU 2, measured recovery
+tests/web/failover.sh                      # same, for the browser viewer
 tests/m2/chat.sh                           # chat + files: permissions, ciphertext-only relay, tamper, revocation
 tests/web/chat.sh                          # browser <-> desktop chat and file transfer
 node tests/m1/sframe-interop.mjs           # Rust ↔ WebCrypto SFrame vector
@@ -149,7 +159,7 @@ gotchas are in [docs/dev-notes.md](docs/dev-notes.md).
 ## Roadmap
 
 Following [PLAN.md](PLAN.md): M0 ✅ vertical proof · M1 ✅ E2EE media · **M2
-(private entry) mostly done** — remaining: OpenMLS, dead-drop transport · M3 SFU/controller failover (not started) · M4 chat and channels (basic: no DMs, search, unread state or fine-grained
+(private entry) mostly done** — remaining: OpenMLS, dead-drop transport · M3 SFU failover (viewer + test sender done; real `stream` sender, controller failover and load-based selection pending) · M4 chat and channels (basic: no DMs, search, unread state or fine-grained
 permissions yet) · M5 file sharing via the relay (no peer-to-peer/cooperative
 cache yet) · M6 packaging and daily use.
 

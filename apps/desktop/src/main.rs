@@ -320,6 +320,46 @@ async fn whoami() -> Result<()> {
     Ok(())
 }
 
+/// SFU URLs to try, most preferred first: the community's admin-signed route
+/// when one is published, otherwise the `--sfu` value.
+async fn sfu_candidates(fallback: &str) -> Vec<String> {
+    if let Ok(Some(p)) = profile::Profile::load() {
+        match p.route().await {
+            Ok(Some(r)) => return r.sfus,
+            Ok(None) => {}
+            Err(e) => tracing::warn!(%e, "could not fetch the SFU route; using --sfu"),
+        }
+    }
+    vec![fallback.to_string()]
+}
+
+/// Connect to the first reachable candidate, trying `start` first and wrapping.
+async fn connect_any(cands: &[String], start: usize) -> Result<(Signaling, tokio::sync::mpsc::Receiver<(String, serde_json::Value)>, usize)> {
+    for k in 0..cands.len() {
+        let i = (start + k) % cands.len();
+        match tokio::time::timeout(std::time::Duration::from_secs(3), Signaling::connect(&cands[i])).await {
+            Ok(Ok((sig, ev))) => return Ok((sig, ev, i)),
+            Ok(Err(e)) => tracing::warn!(url = %cands[i], %e, "sfu unreachable"),
+            Err(_) => tracing::warn!(url = %cands[i], "sfu connect timed out"),
+        }
+    }
+    bail!("no SFU reachable among {} candidate(s)", cands.len())
+}
+
+/// `Write` handle shared across receive threads so the output (file/ffplay)
+/// survives a failover that replaces the receiver.
+#[derive(Clone)]
+struct SharedOut(std::sync::Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl std::io::Write for SharedOut {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
 /// Join the SFU. With a community profile this presents a session token and
 /// keeps it fresh so the SFU only serves current members.
 async fn join_sfu(sig: &signaling::Signaling) -> Result<JoinResult> {
@@ -353,46 +393,80 @@ async fn join_sfu(sig: &signaling::Signaling) -> Result<JoinResult> {
 /// Native video receive path: consume a producer on a PlainTransport, depacketize
 /// + SFrame-decrypt in Rust, decode+display via ffplay on stdin.
 async fn watch(sfu: String, e2ee: bool, producer: Option<String>, dump: Option<String>) -> Result<()> {
-    let (sig, _events) = Signaling::connect(&sfu).await?;
-    let join: JoinResult = join_sfu(&sig).await?;
-    let video = join.producers.iter()
-        .find(|p| producer.as_deref().map_or(true, |id| p.producer_id == id) && p.kind == "video")
-        .ok_or_else(|| anyhow::anyhow!("no video producer on sfu"))?
-        .clone();
-    tracing::info!(producer = %video.producer_id, "watching");
-
-    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    let port = sock.local_addr()?.port();
-    let tr: PlainRecvResult = sig.call(methods::CREATE_PLAIN_RECV, json!({})).await?;
-    sig.call::<serde_json::Value>(methods::CONNECT_PLAIN, json!({
-        "transportId": tr.transport_id, "ip": "127.0.0.1", "port": port,
-    })).await?;
-    let c: serde_json::Value = sig.call(methods::CONSUME_PLAIN, json!({
-        "transportId": tr.transport_id, "producerId": video.producer_id,
-    })).await?;
-    let ssrc = c["rtpParameters"]["encodings"][0]["ssrc"]
-        .as_u64().ok_or_else(|| anyhow::anyhow!("no consumer ssrc"))? as u32;
-    tracing::info!(consumer = %c["consumerId"], %ssrc, "consuming");
-
-    let dec = e2ee.then(|| e2ee_decryptor());
-    if let Some(path) = dump {
-        let f = std::fs::File::create(&path)?;
-        let _recv = media::rtp_recv::h264_recv_loop(sock, ssrc, dec, f);
-        tracing::info!(%path, "dumping; ctrl-c to stop");
-        loop { tokio::time::sleep(std::time::Duration::from_secs(1)).await; }
+    let cands = sfu_candidates(&sfu).await;
+    let dec = e2ee.then(e2ee_decryptor);
+    let mut ffplay = None;
+    let out: Box<dyn std::io::Write + Send> = if let Some(path) = &dump {
+        Box::new(std::fs::File::create(path)?)
+    } else {
+        let mut c = std::process::Command::new("ffplay")
+            .args(["-loglevel", "warning", "-fflags", "nobuffer", "-flags", "low_delay", "-f", "h264", "-i", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let stdin = c.stdin.take().unwrap();
+        ffplay = Some(c);
+        Box::new(stdin)
+    };
+    let out = SharedOut(std::sync::Arc::new(std::sync::Mutex::new(out)));
+    let mut idx = 0usize;
+    let mut lost_at: Option<std::time::Instant> = None;
+    let session = async {
+        loop {
+            // (re)connect and consume the video producer; after a failover the
+            // sender may take a moment to re-publish, so wait for it.
+            let (sig, _events, used) = connect_any(&cands, idx).await?;
+            idx = used;
+            let join: JoinResult = join_sfu(&sig).await?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut producers = join.producers;
+            let video = loop {
+                if let Some(p) = producers.iter().find(|p| producer.as_deref().map_or(true, |id| p.producer_id == id) && p.kind == "video") {
+                    break p.clone();
+                }
+                if std::time::Instant::now() > deadline { bail!("no video producer on sfu"); }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                #[derive(serde::Deserialize, Default)]
+                struct Listed { #[serde(default)] producers: Vec<ProducerInfo> }
+                producers = sig.call::<Listed>(methods::LIST_PRODUCERS, json!({})).await.unwrap_or_default().producers;
+            };
+            tracing::info!(producer = %video.producer_id, sfu = %cands[used], "watching");
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+            let port = sock.local_addr()?.port();
+            let tr: PlainRecvResult = sig.call(methods::CREATE_PLAIN_RECV, json!({})).await?;
+            sig.call::<serde_json::Value>(methods::CONNECT_PLAIN, json!({
+                "transportId": tr.transport_id, "ip": "127.0.0.1", "port": port,
+            })).await?;
+            let c: serde_json::Value = sig.call(methods::CONSUME_PLAIN, json!({
+                "transportId": tr.transport_id, "producerId": video.producer_id,
+            })).await?;
+            let ssrc = c["rtpParameters"]["encodings"][0]["ssrc"].as_u64()
+                .ok_or_else(|| anyhow::anyhow!("no consumer ssrc"))? as u32;
+            if let Some(t) = lost_at.take() {
+                tracing::info!(ms = t.elapsed().as_millis() as u64, sfu = %cands[used], "viewer failover complete");
+            }
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let _recv = media::rtp_recv::h264_recv_loop_stoppable(sock, ssrc, dec.clone(), out.clone(), stop.clone());
+            sig.wait_closed().await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            lost_at = Some(std::time::Instant::now());
+            tracing::warn!(sfu = %cands[used], "sfu connection lost; failing over");
+            idx = (used + 1) % cands.len();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+    match ffplay.as_mut() {
+        Some(c) => {
+            tokio::select! {
+                r = session => r?,
+                _ = tokio::task::spawn_blocking({ let mut c = ffplay.take().unwrap(); move || c.wait() }) => {}
+            }
+            Ok(())
+        }
+        None => { tracing::info!("dumping; ctrl-c to stop"); session.await }
     }
-    let mut ffplay = std::process::Command::new("ffplay")
-        .args(["-loglevel", "warning", "-fflags", "nobuffer", "-flags", "low_delay",
-               "-f", "h264", "-i", "-"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()?;
-    let _recv = media::rtp_recv::h264_recv_loop(sock, ssrc, dec, ffplay.stdin.take().unwrap());
-    ffplay.wait()?;
-    Ok(())
 }
 
-/// Pushes synthetic frames through the real H.264 Annex-B -> Rust RTP path
-/// and verifies the SFU counts bytes on the producer.
 async fn test_audio(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     let (sig, _events) = Signaling::connect(&sfu).await?;
     let _join: JoinResult = join_sfu(&sig).await?;
@@ -407,29 +481,78 @@ async fn test_audio(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     if bytes > 5_000 { println!("RUST AUDIO PATH OK"); Ok(()) } else { bail!("sfu counted no audio bytes") }
 }
 
-async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
-    let (sig, _events) = Signaling::connect(&sfu).await?;
-    let _join: JoinResult = join_sfu(&sig).await?;
+async fn produce_test_video(sig: &Signaling, ssrc: u32) -> Result<(PlainSendResult, ProduceResult)> {
     let t: PlainSendResult = sig.call(methods::CREATE_PLAIN_SEND, json!({})).await?;
-    let ssrc: u32 = 0x1a1a01;
     let produced: ProduceResult = sig.call(methods::PRODUCE_PLAIN, json!({
         "transportId": t.transport_id, "kind": "video",
         "rtpParameters": media::rtp::video_h264(
             &RtpDest { ip: t.ip.clone(), port: t.port, payload_type: VIDEO_PT, ssrc, name: "t".into() }, "0"),
         "appData": { "stream": "test-video" },
     })).await?;
-    let before = producer_bytes(&sig, &produced.producer_id).await;
+    Ok((t, produced))
+}
 
-    let (mut enc, mut stdin, stdout) = media::ffmpeg::h264_annexb_encoder("bgra", 640, 360, 30, 1_500_000)?;
-    let sender = std::sync::Arc::new(std::sync::Mutex::new(
-        media::rtp_send::RtpSender::connect(&t.ip, t.port, VIDEO_PT, ssrc)?));
+fn spawn_rtcp_logger(sender: &std::sync::Arc<std::sync::Mutex<media::rtp_send::RtpSender>>) -> Result<()> {
     let rtcp_sock = sender.lock().unwrap().try_clone_socket()?;
     let (rtcp_tx, rtcp_rx) = std_mpsc::channel();
     std::thread::spawn(move || media::rtp_send::RtpSender::rtcp_loop(rtcp_sock, rtcp_tx));
     std::thread::spawn(move || while let Ok(ev) = rtcp_rx.recv() { tracing::info!(?ev, "rtcp"); });
+    Ok(())
+}
+
+async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
+    let cands = sfu_candidates(&sfu).await;
+    let (sig, _events, idx) = connect_any(&cands, 0).await?;
+    let _join: JoinResult = join_sfu(&sig).await?;
+    let ssrc: u32 = 0x1a1a01;
+    let (t, produced) = produce_test_video(&sig, ssrc).await?;
+    let before = producer_bytes(&sig, &produced.producer_id).await;
+    let current = std::sync::Arc::new(std::sync::Mutex::new((sig.clone(), produced.producer_id.clone(), before)));
+
+    let (mut enc, mut stdin, stdout) = media::ffmpeg::h264_annexb_encoder("bgra", 640, 360, 30, 1_500_000)?;
+    let sender = std::sync::Arc::new(std::sync::Mutex::new(
+        media::rtp_send::RtpSender::connect(&t.ip, t.port, VIDEO_PT, ssrc)?));
+    spawn_rtcp_logger(&sender)?;
     let e2ee_enc = e2ee.then(e2ee_encryptor);
-    let _pump = media::rtp_send::h264_rtp_pump(stdout, sender,
+    let _pump = media::rtp_send::h264_rtp_pump(stdout, sender.clone(),
         e2ee_enc.as_ref().map(|e| e.share()));
+
+    // Failover: when the SFU connection drops, publish on the next SFU of the
+    // route and point the running RTP stream at its transport. The encoder and
+    // packetizer keep running; viewers wait for the next keyframe (<= 2 s GOP).
+    {
+        let (cands, sender, current) = (cands.clone(), sender.clone(), current.clone());
+        tokio::spawn(async move {
+            let mut idx = idx;
+            loop {
+                let sig = current.lock().unwrap().0.clone();
+                sig.wait_closed().await;
+                let t0 = std::time::Instant::now();
+                tracing::warn!("sfu connection lost; failing over");
+                loop {
+                    idx = (idx + 1) % cands.len();
+                    let attempt = async {
+                        let (sig, _ev, used) = connect_any(&cands, idx).await?;
+                        join_sfu(&sig).await?;
+                        let (t, produced) = produce_test_video(&sig, ssrc).await?;
+                        Ok::<_, anyhow::Error>((sig, used, t, produced))
+                    };
+                    match attempt.await {
+                        Ok((sig, used, t, produced)) => {
+                            idx = used;
+                            if let Err(e) = sender.lock().unwrap().retarget(&t.ip, t.port) { tracing::error!(%e, "retarget"); continue }
+                            let _ = spawn_rtcp_logger(&sender);
+                            let base = producer_bytes(&sig, &produced.producer_id).await;
+                            *current.lock().unwrap() = (sig, produced.producer_id, base);
+                            tracing::info!(ms = t0.elapsed().as_millis() as u64, sfu = %cands[used], "sender failover complete");
+                            break;
+                        }
+                        Err(e) => { tracing::warn!(%e, "failover attempt failed"); tokio::time::sleep(std::time::Duration::from_millis(500)).await; }
+                    }
+                }
+            }
+        });
+    }
 
     // feed testsrc2 frames into the encoder stdin
     let mut src = std::process::Command::new("ffmpeg")
@@ -443,7 +566,10 @@ async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     let mut frame = vec![0u8; 640 * 360 * 4];
     let mut n = 0u64;
     while std::time::Instant::now() < t_end {
-        if src_out.read_exact(&mut frame).is_err() { break }
+        // blocking read on a dedicated thread would be cleaner; frames arrive at
+        // 30 fps so this stays short and lets the runtime run the failover task
+        let r = tokio::task::block_in_place(|| src_out.read_exact(&mut frame));
+        if r.is_err() { break }
         if stdin.write_all(&frame).is_err() { break }
         n += 1;
     }
@@ -451,9 +577,10 @@ async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     let _ = enc.wait();
     let _ = src.kill();
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-    let after = producer_bytes(&sig, &produced.producer_id).await;
-    println!("frames_in={n} sfu_bytes {} -> {} (delta {})", before, after, after.saturating_sub(before));
-    if after > before + 10_000 { println!("RUST RTP PATH OK"); Ok(()) }
+    let (sig, pid, base) = current.lock().unwrap().clone();
+    let after = producer_bytes(&sig, &pid).await;
+    println!("frames_in={n} sfu_bytes {} -> {} (delta {})", base, after, after.saturating_sub(base));
+    if after > base + 10_000 { println!("RUST RTP PATH OK"); Ok(()) }
     else { bail!("sfu counted no video bytes — packetizer broken") }
 }
 
