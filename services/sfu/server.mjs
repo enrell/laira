@@ -10,6 +10,7 @@ import { resolve, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import * as mediasoup from 'mediasoup';
+import { createPublicKey, verify as edVerify } from 'node:crypto';
 
 const env = process.env;
 const config = {
@@ -19,6 +20,10 @@ const config = {
   announcedIp: env.LAIRA_ANNOUNCED_IP || '127.0.0.1',
   rtcMinPort: Number(env.LAIRA_RTC_MIN_PORT || 40000),
   rtcMaxPort: Number(env.LAIRA_RTC_MAX_PORT || 49999),
+  // Membership auth (PLAN §11). When both are set, every peer must present an
+  // admin-signed session token from services/control; unset = open (M0 dev).
+  adminKey: env.LAIRA_ADMIN_KEY || '',
+  communityId: env.LAIRA_COMMUNITY_ID || '',
   tlsCert: env.LAIRA_TLS_CERT || '',
   tlsKey: env.LAIRA_TLS_KEY || '',
   staticDir: env.LAIRA_STATIC_DIR ||
@@ -44,6 +49,33 @@ const mediaCodecs = [
     },
   },
 ];
+
+const authEnabled = !!(config.adminKey && config.communityId);
+const SPKI_ED25519 = Buffer.from('302a300506032b6570032100', 'hex');
+const adminPub = authEnabled
+  ? createPublicKey({ key: Buffer.concat([SPKI_ED25519, Buffer.from(config.adminKey, 'hex')]), format: 'der', type: 'spki' })
+  : null;
+
+// Canonical encoding shared with crates/identity (`Canon`): u32-BE length
+// prefix per field, first field is the domain label.
+function canon(domain, ...fields) {
+  const parts = [domain, ...fields].map((f) => Buffer.isBuffer(f) ? f : Buffer.from(f));
+  return Buffer.concat(parts.flatMap((b) => {
+    const len = Buffer.alloc(4); len.writeUInt32BE(b.length); return [len, b];
+  }));
+}
+function u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; }
+function tokenBody(t) {
+  return canon('laira/session-token/v1', Buffer.from(t.community_id, 'hex'), Buffer.from(t.member, 'hex'), u64(t.expires_at));
+}
+// Returns the expiry (unix s) of a valid token, throws otherwise.
+function verifyToken(t) {
+  if (!t || t.community_id !== config.communityId) throw new Error('wrong community');
+  if (!Number.isSafeInteger(t.expires_at) || t.expires_at * 1000 <= Date.now()) throw new Error('token expired');
+  const ok = edVerify(null, tokenBody(t), adminPub, Buffer.from(t.signature, 'hex'));
+  if (!ok) throw new Error('bad token signature');
+  return t.expires_at;
+}
 
 const worker = await mediasoup.createWorker({
   rtcMinPort: config.rtcMinPort,
@@ -97,6 +129,8 @@ function listenInfo(ip = '0.0.0.0') {
 
 const handlers = {
   async join(peer, params, socket) {
+    if (authEnabled) { peer.member = params.token.member; peer.exp = verifyToken(params.token); }
+    peer.authed = true;
     peer.socket = socket;
     return {
       peerId: peer.id,
@@ -104,6 +138,16 @@ const handlers = {
       producers: [...producerIndex.entries()].map(([producerId, p]) => (
         { producerId, kind: p.kind, appData: p.appData || {}, peerId: p.peerId })),
     };
+  },
+
+  // Members refresh before expiry; a revoked member can't get a new token
+  // from the control service and is dropped when the old one lapses.
+  async refreshToken(peer, params) {
+    if (!authEnabled) return {};
+    const t = params.token;
+    if (t.member !== peer.member) throw new Error('token for a different member');
+    peer.exp = verifyToken(t);
+    return { expiresAt: peer.exp };
   },
 
   async createSendTransport(peer) {
@@ -267,6 +311,7 @@ wss.on('connection', (socket) => {
     const fail = (error) =>
       socket.send(JSON.stringify({ id, ok: false, error: String(error?.message || error) }));
     if (!handler) return fail(`unknown method ${method}`);
+    if (method !== 'join' && !peer.authed) return fail('join first');
     try { reply(await handler(peer, params, socket)); }
     catch (e) { fail(e); }
   });
@@ -278,6 +323,18 @@ wss.on('connection', (socket) => {
     console.log(`peer left: ${peer.id}`);
   });
 });
+
+// Drop peers whose session token lapsed (revoked members can't renew).
+setInterval(() => {
+  if (!authEnabled) return;
+  const now = Date.now() / 1000;
+  for (const peer of peers.values()) {
+    if (peer.authed && peer.exp < now) {
+      console.log(`peer ${peer.id} token expired; closing`);
+      peer.socket.close(4001, 'token expired');
+    }
+  }
+}, 5000).unref();
 
 // Periodic per-producer bitrate log for M0 measurements (MED-02/goal metrics).
 setInterval(async () => {
@@ -296,6 +353,7 @@ setInterval(async () => {
 server.listen(config.port, config.host, () => {
   const scheme = config.tlsCert ? 'https' : 'http';
   console.log(`laira-sfu listening on ${scheme}://${config.host}:${config.port}`);
+  console.log(`auth: ${authEnabled ? 'membership tokens required' : 'OPEN (no LAIRA_ADMIN_KEY)'}`);
   console.log(`rtp announced=${config.announcedIp} ports=${config.rtcMinPort}-${config.rtcMaxPort}`);
   console.log(`static dir: ${config.staticDir} (${existsSync(config.staticDir) ? 'found' : 'MISSING — build apps/web'})`);
 });

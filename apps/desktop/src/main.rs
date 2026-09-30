@@ -6,6 +6,7 @@
 //!   laira-desktop stream            # portal picker -> stream to SFU
 
 mod portal;
+mod profile;
 mod signaling;
 
 use anyhow::{bail, Context, Result};
@@ -38,6 +39,21 @@ enum Cmd {
     ListAudio,
     /// List PipeWire capture sources (candidates for --mic).
     ListMics,
+    /// Join a community: consume an invite (JSON file, or `-` for stdin).
+    Join {
+        #[arg(long)]
+        control: String,
+        invite: String,
+    },
+    /// Use the admin identity from a `laira-control init` dir as this profile.
+    AdoptAdmin {
+        #[arg(long)]
+        control: String,
+        #[arg(long)]
+        dir: std::path::PathBuf,
+    },
+    /// Show this profile's identity, roster slot and current epoch.
+    Whoami,
     /// Capture screen + game audio + mic and stream through the SFU.
     Stream(StreamArgs),
     /// E2E check of the Rust RTP path: testsrc2 -> Annex-B -> our packetizer
@@ -46,6 +62,15 @@ enum Cmd {
         #[arg(long, default_value = "ws://127.0.0.1:4443")]
         sfu: String,
         #[arg(long, default_value_t = 6)]
+        seconds: u64,
+        #[arg(long)]
+        e2ee: bool,
+    },
+    /// Send a synthetic 440 Hz tone as an audio producer (no PipeWire needed).
+    TestAudio {
+        #[arg(long, default_value = "ws://127.0.0.1:4443")]
+        sfu: String,
+        #[arg(long, default_value_t = 8)]
         seconds: u64,
         #[arg(long)]
         e2ee: bool,
@@ -110,17 +135,161 @@ async fn main() -> Result<()> {
     match cli.cmd {
         Cmd::ListAudio => list_audio(),
         Cmd::ListMics => list_mics(),
-        Cmd::Stream(args) => stream(args).await,
-        Cmd::TestVideo { sfu, seconds, e2ee } => test_video(sfu, seconds, e2ee).await,
-        Cmd::Watch { sfu, e2ee, producer, dump } => watch(sfu, e2ee, producer, dump).await,
+        Cmd::Join { control, invite } => {
+            let raw = if invite == "-" { std::io::read_to_string(std::io::stdin())? } else { std::fs::read_to_string(&invite)? };
+            let p = profile::Profile::join(&control, serde_json::from_str(&raw)?).await?;
+            println!("joined; member key {}", hex::encode(p.public()?.0));
+            Ok(())
+        }
+        Cmd::AdoptAdmin { control, dir } => {
+            let p = profile::Profile::adopt_admin(&control, &dir).await?;
+            println!("adopted admin {}", hex::encode(p.public()?.0));
+            Ok(())
+        }
+        Cmd::Whoami => whoami().await,
+        Cmd::Stream(args) => { if args.e2ee { init_e2ee().await?; } stream(args).await }
+        Cmd::TestVideo { sfu, seconds, e2ee } => { if e2ee { init_e2ee().await?; } test_video(sfu, seconds, e2ee).await }
+        Cmd::TestAudio { sfu, seconds, e2ee } => { if e2ee { init_e2ee().await?; } test_audio(sfu, seconds, e2ee).await }
+        Cmd::Watch { sfu, e2ee, producer, dump } => { if e2ee { init_e2ee().await?; } watch(sfu, e2ee, producer, dump).await }
     }
+}
+
+/// Live SFrame state for this process (set once by `init_e2ee`). The encryptor
+/// and decryptor are shared handles: the epoch poller rekeys them in place.
+struct E2eeKeys {
+    enc: media::sframe::SframeEncryptor,
+    dec: media::sframe::SframeDecryptor,
+}
+
+static E2EE: std::sync::OnceLock<E2eeKeys> = std::sync::OnceLock::new();
+
+const EPOCH_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+const EPOCH_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Resolve keys: a joined profile (epoch fetched from the control service,
+/// KID bound by the admin-signed roster; kept fresh by a poller that rekeys
+/// live and exits if we are removed) wins; otherwise `LAIRA_EPOCH_SECRET` /
+/// `LAIRA_EPOCH` / `LAIRA_KID` / `LAIRA_ACCEPT_KIDS`; otherwise the PUBLIC M1
+/// test key, loudly.
+async fn init_e2ee() -> Result<()> {
+    let keys = if let Some(p) = profile::Profile::load()? {
+        let me = p.public()?;
+        let (secret, bundle) = p.latest_epoch().await?;
+        let kid = bundle.kid_of(&me).context("not in epoch roster")?;
+        tracing::info!(epoch = secret.epoch(), kid, "sframe: keys from community epoch");
+        let senders = |s: &laira_identity::EpochSecret, b: &laira_identity::EpochBundle|
+            b.roster.iter().map(|(k, _)| (*k, s.sframe_base_key(*k))).collect::<Vec<_>>();
+        let keys = E2eeKeys {
+            enc: media::sframe::SframeEncryptor::with_kid(&secret.sframe_base_key(kid), kid),
+            dec: media::sframe::SframeDecryptor::with_senders(senders(&secret, &bundle)),
+        };
+        let (enc, dec, mut epoch) = (keys.enc.share(), keys.dec.clone(), secret.epoch());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(EPOCH_POLL).await;
+                match p.latest_epoch().await {
+                    Ok((s, b)) if s.epoch() > epoch => {
+                        if b.kid_of(&me) != Some(kid) {
+                            tracing::error!("roster slot changed; stopping");
+                            std::process::exit(3);
+                        }
+                        enc.rekey(&s.sframe_base_key(kid));
+                        dec.rotate(senders(&s, &b));
+                        epoch = s.epoch();
+                        tracing::info!(epoch, "sframe: rekeyed to new epoch");
+                        let d = dec.clone();
+                        tokio::spawn(async move { tokio::time::sleep(EPOCH_GRACE).await; d.forget_previous(); });
+                    }
+                    Ok(_) => {}
+                    Err(e) if format!("{e:#}").contains("cannot open") => {
+                        tracing::error!(%e, "removed from the community; stopping");
+                        std::process::exit(3);
+                    }
+                    Err(e) => tracing::warn!(%e, "epoch poll failed (keeping current keys)"),
+                }
+            }
+        });
+        keys
+    } else if let Ok(hexs) = std::env::var("LAIRA_EPOCH_SECRET") {
+        let bytes: [u8; 32] = hex::decode(hexs.trim())?.try_into()
+            .map_err(|_| anyhow::anyhow!("LAIRA_EPOCH_SECRET must be 64 hex chars"))?;
+        let epoch = std::env::var("LAIRA_EPOCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let e = laira_identity::EpochSecret::new(bytes, epoch);
+        let kid: u8 = std::env::var("LAIRA_KID").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        anyhow::ensure!(kid <= 7, "LAIRA_KID must be 0..=7");
+        let kids: Vec<u8> = std::env::var("LAIRA_ACCEPT_KIDS").unwrap_or_else(|_| "0".into())
+            .split(',').filter_map(|k| k.trim().parse().ok()).filter(|k| *k <= 7).collect();
+        E2eeKeys {
+            enc: media::sframe::SframeEncryptor::with_kid(&e.sframe_base_key(kid), kid),
+            dec: media::sframe::SframeDecryptor::with_senders(kids.iter().map(|k| (*k, e.sframe_base_key(*k)))),
+        }
+    } else {
+        tracing::warn!("no profile or LAIRA_EPOCH_SECRET: using the PUBLIC M1 test key (not confidential)");
+        E2eeKeys {
+            enc: media::sframe::SframeEncryptor::new(&media::sframe::TEST_BASE_KEY),
+            dec: media::sframe::SframeDecryptor::new(&media::sframe::TEST_BASE_KEY),
+        }
+    };
+    E2EE.set(keys).map_err(|_| anyhow::anyhow!("e2ee already initialised"))
+}
+
+fn e2ee_encryptor() -> media::sframe::SframeEncryptor {
+    E2EE.get().expect("init_e2ee not called").enc.share()
+}
+
+fn e2ee_decryptor() -> media::sframe::SframeDecryptor {
+    E2EE.get().expect("init_e2ee not called").dec.clone()
+}
+
+async fn whoami() -> Result<()> {
+    let p = profile::Profile::load()?.context("no profile; run `join` or `adopt-admin`")?;
+    let (secret, bundle) = p.latest_epoch().await?;
+    println!("member   {}", hex::encode(p.public()?.0));
+    println!("community {}", hex::encode(p.genesis.community_id()));
+    println!("kid      {}", bundle.kid_of(&p.public()?).unwrap_or(255));
+    println!("epoch    {}", secret.epoch());
+    println!("roster   {} member(s)", bundle.roster.len());
+    // Fingerprint (not the key) of slot 0's SFrame key, for cross-implementation checks.
+    use sha2::Digest;
+    println!("key0-fp  {}", hex::encode(&sha2::Sha256::digest(secret.sframe_base_key(0))[..6]));
+    Ok(())
+}
+
+/// Join the SFU. With a community profile this presents a session token and
+/// keeps it fresh so the SFU only serves current members.
+async fn join_sfu(sig: &signaling::Signaling) -> Result<JoinResult> {
+    let Some(p) = profile::Profile::load()? else {
+        return sig.call(methods::JOIN, json!({})).await;
+    };
+    let token = p.session_token().await?;
+    let joined: JoinResult = sig.call(methods::JOIN, json!({ "token": token })).await?;
+    let sig = sig.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let r = match p.session_token().await {
+                Ok(t) => sig.call_unit("refreshToken", json!({ "token": t })).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
+                // Only an explicit refusal (revoked) ends the session; a
+                // control-service outage keeps the stream until the token lapses.
+                if format!("{e:#}").contains("token refused") {
+                    tracing::error!(%e, "session token refused; leaving");
+                    std::process::exit(3);
+                }
+                tracing::warn!(%e, "session token refresh failed; will retry");
+            }
+        }
+    });
+    Ok(joined)
 }
 
 /// Native video receive path: consume a producer on a PlainTransport, depacketize
 /// + SFrame-decrypt in Rust, decode+display via ffplay on stdin.
 async fn watch(sfu: String, e2ee: bool, producer: Option<String>, dump: Option<String>) -> Result<()> {
     let (sig, _events) = Signaling::connect(&sfu).await?;
-    let join: JoinResult = sig.call(methods::JOIN, json!({})).await?;
+    let join: JoinResult = join_sfu(&sig).await?;
     let video = join.producers.iter()
         .find(|p| producer.as_deref().map_or(true, |id| p.producer_id == id) && p.kind == "video")
         .ok_or_else(|| anyhow::anyhow!("no video producer on sfu"))?
@@ -140,7 +309,7 @@ async fn watch(sfu: String, e2ee: bool, producer: Option<String>, dump: Option<S
         .as_u64().ok_or_else(|| anyhow::anyhow!("no consumer ssrc"))? as u32;
     tracing::info!(consumer = %c["consumerId"], %ssrc, "consuming");
 
-    let dec = e2ee.then(|| media::sframe::SframeDecryptor::new(&media::sframe::TEST_BASE_KEY));
+    let dec = e2ee.then(|| e2ee_decryptor());
     if let Some(path) = dump {
         let f = std::fs::File::create(&path)?;
         let _recv = media::rtp_recv::h264_recv_loop(sock, ssrc, dec, f);
@@ -159,9 +328,23 @@ async fn watch(sfu: String, e2ee: bool, producer: Option<String>, dump: Option<S
 
 /// Pushes synthetic frames through the real H.264 Annex-B -> Rust RTP path
 /// and verifies the SFU counts bytes on the producer.
+async fn test_audio(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
+    let (sig, _events) = Signaling::connect(&sfu).await?;
+    let _join: JoinResult = join_sfu(&sig).await?;
+    let mut children = Vec::new();
+    let (level_tx, _level_rx) = std_mpsc::channel();
+    let dest = RtpDest { ip: String::new(), port: 0, payload_type: MIC_PT, ssrc: 0x2b2b02, name: "tone".into() };
+    let track = start_audio_source(&sig, dest, e2ee, &mut children, level_tx, "test-audio").await?;
+    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+    let bytes = producer_bytes(&sig, &track.producer_id).await;
+    for mut c in children { let _ = c.kill(); }
+    println!("audio sfu_bytes={bytes}");
+    if bytes > 5_000 { println!("RUST AUDIO PATH OK"); Ok(()) } else { bail!("sfu counted no audio bytes") }
+}
+
 async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     let (sig, _events) = Signaling::connect(&sfu).await?;
-    let _join: JoinResult = sig.call(methods::JOIN, json!({})).await?;
+    let _join: JoinResult = join_sfu(&sig).await?;
     let t: PlainSendResult = sig.call(methods::CREATE_PLAIN_SEND, json!({})).await?;
     let ssrc: u32 = 0x1a1a01;
     let produced: ProduceResult = sig.call(methods::PRODUCE_PLAIN, json!({
@@ -179,8 +362,9 @@ async fn test_video(sfu: String, seconds: u64, e2ee: bool) -> Result<()> {
     let (rtcp_tx, rtcp_rx) = std_mpsc::channel();
     std::thread::spawn(move || media::rtp_send::RtpSender::rtcp_loop(rtcp_sock, rtcp_tx));
     std::thread::spawn(move || while let Ok(ev) = rtcp_rx.recv() { tracing::info!(?ev, "rtcp"); });
+    let e2ee_enc = e2ee.then(e2ee_encryptor);
     let _pump = media::rtp_send::h264_rtp_pump(stdout, sender,
-        e2ee.then(|| media::sframe::SframeEncryptor::new(&media::sframe::TEST_BASE_KEY)));
+        e2ee_enc.as_ref().map(|e| e.share()));
 
     // feed testsrc2 frames into the encoder stdin
     let mut src = std::process::Command::new("ffmpeg")
@@ -326,6 +510,7 @@ fn pump_video(
                 while let Ok(ev) = rtcp_rx.recv() { tracing::info!(?ev, "rtcp"); }
             });
         }
+        let e2ee_enc = e2ee.then(e2ee_encryptor);
         let mut enc: Option<VideoStdin> = None;
         let mut n = 0u64;
         let mut t0 = std::time::Instant::now();
@@ -342,7 +527,7 @@ fn pump_video(
                                 Ok((child, stdin, stdout)) => {
                                     media::rtp_send::h264_rtp_pump(
                                         stdout, sender.clone(),
-                                        e2ee.then(|| media::sframe::SframeEncryptor::new(&media::sframe::TEST_BASE_KEY)),
+                                        e2ee_enc.as_ref().map(|e| e.share()),
                                     );
                                     Some(VideoStdin::AnnexB { stdin, child })
                                 }
@@ -381,7 +566,7 @@ fn pump_video(
 
 async fn stream(args: StreamArgs) -> Result<()> {
     let (sig, mut events) = Signaling::connect(&args.sfu).await?;
-    let join: JoinResult = sig.call(methods::JOIN, json!({})).await?;
+    let join: JoinResult = join_sfu(&sig).await?;
     tracing::info!(peer = %join.peer_id, "joined sfu");
 
     let base: u32 = (std::process::id() & 0xFFFF) << 8;
@@ -417,17 +602,17 @@ async fn stream(args: StreamArgs) -> Result<()> {
     if !args.no_game_audio {
         if let Some(target) = resolve_audio_target(args.audio_target)? {
             let dest = RtpDest { ip: String::new(), port: 0, payload_type: GAME_PT, ssrc: base | 2, name: "game".into() };
-            sends.push(start_audio(&sig, dest, Some(target), 128_000, "game-audio", &mut children, level_tx.clone()).await?);
+            sends.push(start_audio(&sig, dest, args.e2ee, Some(target), 128_000, "game-audio", &mut children, level_tx.clone()).await?);
         }
     }
     if !args.no_mic {
         let dest = RtpDest { ip: String::new(), port: 0, payload_type: MIC_PT, ssrc: base | 3, name: "mic".into() };
-        sends.push(start_audio(&sig, dest, args.mic, 64_000, "mic", &mut children, level_tx.clone()).await?);
+        sends.push(start_audio(&sig, dest, args.e2ee, args.mic, 64_000, "mic", &mut children, level_tx.clone()).await?);
     }
 
     // --- consume remote audio ---
     for p in join.producers.iter().filter(|p| p.peer_id != join.peer_id) {
-        if let Err(e) = handle_remote(&sig, p.clone(), &mut players).await {
+        if let Err(e) = handle_remote(&sig, p.clone(), &mut players, args.e2ee).await {
             tracing::warn!(%e, producer = %p.producer_id, "consume failed");
         }
     }
@@ -444,7 +629,7 @@ async fn stream(args: StreamArgs) -> Result<()> {
                     "newProducer" => {
                         if let Ok(p) = serde_json::from_value::<ProducerInfo>(data) {
                             if p.peer_id != join.peer_id {
-                                if let Err(e) = handle_remote(&sig, p, &mut players).await {
+                                if let Err(e) = handle_remote(&sig, p, &mut players, args.e2ee).await {
                                     tracing::warn!(%e, "consume failed");
                                 }
                             }
@@ -481,14 +666,40 @@ async fn stream(args: StreamArgs) -> Result<()> {
 
 /// pw-record -> pump (with RMS meter) -> ffmpeg opus -> RTP. `target` is the
 /// PipeWire serial of the app stream; None = default source (mic).
+async fn start_audio_source(
+    sig: &Signaling,
+    dest: RtpDest,
+    e2ee: bool,
+    children: &mut Vec<Child>,
+    level: std_mpsc::Sender<(String, f64)>,
+    label: &'static str,
+) -> Result<SendTrack> {
+    start_audio_impl(sig, dest, e2ee, None, 64_000, label, children, level, true).await
+}
+
 async fn start_audio(
     sig: &Signaling,
-    mut dest: RtpDest,
+    dest: RtpDest,
+    e2ee: bool,
     target: Option<u64>,
     bitrate: u32,
     label: &'static str,
     children: &mut Vec<Child>,
     level: std_mpsc::Sender<(String, f64)>,
+) -> Result<SendTrack> {
+    start_audio_impl(sig, dest, e2ee, target, bitrate, label, children, level, false).await
+}
+
+async fn start_audio_impl(
+    sig: &Signaling,
+    mut dest: RtpDest,
+    e2ee: bool,
+    target: Option<u64>,
+    bitrate: u32,
+    label: &'static str,
+    children: &mut Vec<Child>,
+    level: std_mpsc::Sender<(String, f64)>,
+    tone: bool,
 ) -> Result<SendTrack> {
     let t: PlainSendResult = sig.call(methods::CREATE_PLAIN_SEND, json!({})).await?;
     dest.ip = t.ip; dest.port = t.port;
@@ -497,8 +708,22 @@ async fn start_audio(
         "rtpParameters": media::rtp::audio_opus(&dest, "1"),
         "appData": { "stream": label },
     })).await?;
-    let mut rec = media::ffmpeg::audio_capture(target)?;
-    let enc = media::ffmpeg::audio_encoder(&dest, bitrate)?;
+    let mut rec = match tone {
+        true => media::ffmpeg::audio_tone()?,
+        false => media::ffmpeg::audio_capture(target)?,
+    };
+    // With E2EE, ffmpeg targets a local relay that SFrame-protects each Opus
+    // payload and forwards to the SFU from one persistent socket.
+    let mut ff_dest = dest.clone();
+    if e2ee {
+        let listen = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        ff_dest.ip = "127.0.0.1".into();
+        ff_dest.port = listen.local_addr()?.port();
+        let sfu: std::net::SocketAddr = format!("{}:{}", dest.ip, dest.port).parse()
+            .context("sfu rtp address")?;
+        media::rtp_relay::encrypt_relay(listen, std::net::UdpSocket::bind("0.0.0.0:0")?, sfu, e2ee_encryptor());
+    }
+    let enc = media::ffmpeg::audio_encoder(&ff_dest, bitrate)?;
     let stdout = rec.stdout.take().context("pw-record stdout")?;
     pump_pcm(stdout, enc.stdin, level, label);
     children.push(rec);
@@ -512,6 +737,7 @@ async fn handle_remote(
     sig: &Signaling,
     p: ProducerInfo,
     players: &mut HashMap<String, Child>,
+    e2ee: bool,
 ) -> Result<()> {
     if p.kind != "audio" {
         tracing::info!(producer = %p.producer_id, "skipping remote video (M0)");
@@ -519,10 +745,17 @@ async fn handle_remote(
     }
     let t: PlainRecvResult = sig.call(methods::CREATE_PLAIN_RECV, json!({})).await?;
     let tmp = std::net::UdpSocket::bind("127.0.0.1:0")?;
-    let port = tmp.local_addr()?.port();
+    let port = tmp.local_addr()?.port(); // where the local ffmpeg player listens
+    // With E2EE the SFU sends to a relay socket that decrypts and forwards to
+    // the player; otherwise it sends straight to the player's port.
+    let relay_in = if e2ee { Some(std::net::UdpSocket::bind("127.0.0.1:0")?) } else { None };
+    let sfu_port = relay_in.as_ref().map_or(Ok(port), |s| s.local_addr().map(|a| a.port()))?;
     drop(tmp);
+    if let Some(l) = relay_in {
+        media::rtp_relay::decrypt_relay(l, std::net::SocketAddr::from(([127, 0, 0, 1], port)), e2ee_decryptor());
+    }
     sig.call_unit(methods::CONNECT_PLAIN, json!({
-        "transportId": t.transport_id, "ip": "127.0.0.1", "port": port,
+        "transportId": t.transport_id, "ip": "127.0.0.1", "port": sfu_port,
     })).await?;
     let c: ConsumePlainResult = sig.call(methods::CONSUME_PLAIN, json!({
         "transportId": t.transport_id, "producerId": p.producer_id,

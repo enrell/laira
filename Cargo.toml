@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "apps/desktop",
+    "crates/identity",
     "crates/media",
     "crates/protocol",
+    "services/control",
 ]
 
 [workspace.dependencies]

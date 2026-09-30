@@ -11,13 +11,14 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message;
 
+#[derive(Clone)]
 pub struct Signaling {
     write: Arc<Mutex<futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
         Message,
     >>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
 }
 
 impl Signaling {
@@ -55,7 +56,7 @@ impl Signaling {
             Self {
                 write: Arc::new(Mutex::new(write)),
                 pending,
-                next_id: AtomicU64::new(1),
+                next_id: Arc::new(AtomicU64::new(1)),
             },
             events,
         ))

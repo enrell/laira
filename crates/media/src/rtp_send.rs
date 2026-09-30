@@ -224,26 +224,22 @@ pub fn h264_rtp_pump(
     mut enc: Option<crate::sframe::SframeEncryptor>,
 ) -> std::thread::JoinHandle<()>
 {
-    // Encrypted wire format per access unit — two logical NALs sharing one ts:
-    //   [0] a real SPS NAL (type 7) — mediasoup's SimpleConsumer gates video
-    //       forwarding on IsKeyFrame(), which keys on NAL type 7 only
-    //       (RTC/RTP/Codecs/H264.cpp). A real SPS passes the gate and is
-    //       harmless codec config for the decoder.
-    //   [1] 0x66 || sframe_blob — type 6 (SEI): opaque payload the browser
-    //       depacketizer keeps in frame.data untouched (unlike a type-7 NAL,
-    //       which Chrome could interpret as codec config and never surface).
-    // plaintext inside the blob is Annex-B (00 00 00 01 before each NAL),
-    // matching the depacketizer's output format.
+    // Encrypted wire format: see crate::wire (real SPS/PPS + a slice-typed
+    // blob NAL, escaped so ciphertext can't form start codes).
     fn flush_au(
         sender: &std::sync::Arc<std::sync::Mutex<RtpSender>>,
         au: &mut Vec<Vec<u8>>,
         ts: u32,
         enc: &mut Option<crate::sframe::SframeEncryptor>,
-        last_sps: &mut Option<Vec<u8>>,
+        last_cfg: &mut (Option<Vec<u8>>, Option<Vec<u8>>),
     ) {
         if au.is_empty() { return }
         for nal in au.iter() {
-            if nal[0] & 0x1F == 7 { *last_sps = Some(nal.clone()); }
+            match nal[0] & 0x1F {
+                7 => last_cfg.0 = Some(nal.clone()),
+                8 => last_cfg.1 = Some(nal.clone()),
+                _ => {}
+            }
         }
         // debug tap: record the plaintext Annex-B we are about to packetize
         if let Some(Some(path)) = TAP.get() {
@@ -261,14 +257,18 @@ pub fn h264_rtp_pump(
             }
             match e.encrypt(&frame) {
                 Ok(ct) => {
-                    let mut wire = Vec::with_capacity(ct.len() + 1);
-                    wire.push(0x66);
-                    wire.extend_from_slice(&ct);
-                    let decoy;
-                    let parts: Vec<&[u8]> = match last_sps.as_ref() {
-                        Some(sps) => { decoy = sps.clone(); vec![decoy.as_slice(), wire.as_slice()] }
-                        None => vec![wire.as_slice()],
-                    };
+                    let key = crate::wire::au_is_key(au);
+                    let blob = crate::wire::blob_nal(key, &ct);
+                    let mut parts: Vec<&[u8]> = Vec::with_capacity(3);
+                    if key {
+                        // Real parameter sets ahead of the IDR-typed blob: mediasoup
+                        // gates on SPS and browsers need SPS+PPS+IDR for a keyframe.
+                        if let (Some(sps), Some(pps)) = (last_cfg.0.as_deref(), last_cfg.1.as_deref()) {
+                            parts.push(sps);
+                            parts.push(pps);
+                        }
+                    }
+                    parts.push(&blob);
                     if let Err(err) = sender.send_access_unit(&parts, ts) {
                         tracing::warn!(%err, "rtp send failed");
                     }
@@ -289,7 +289,7 @@ pub fn h264_rtp_pump(
         let mut splitter = AnnexbSplitter::new();
         let mut au: Vec<Vec<u8>> = Vec::new();
         let mut au_ts = sender.lock().unwrap().now_ts();
-        let mut last_sps: Option<Vec<u8>> = None;
+        let mut last_cfg: (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
         let mut buf = [0u8; 256 * 1024];
         loop {
             match src.read(&mut buf) {
@@ -299,7 +299,7 @@ pub fn h264_rtp_pump(
                         if nal.is_empty() { continue }
                         if nal[0] & 0x1F == NAL_AUD {
                             // AUD opens a new access unit — flush the previous.
-                            flush_au(&sender, &mut au, au_ts, &mut enc, &mut last_sps);
+                            flush_au(&sender, &mut au, au_ts, &mut enc, &mut last_cfg);
                             au_ts = sender.lock().unwrap().now_ts();
                         }
                         au.push(nal);
@@ -308,7 +308,7 @@ pub fn h264_rtp_pump(
                 Err(_) => break,
             }
         }
-        flush_au(&sender, &mut au, au_ts, &mut enc, &mut last_sps);
+        flush_au(&sender, &mut au, au_ts, &mut enc, &mut last_cfg);
         tracing::info!("h264 rtp pump: encoder stdout closed");
     })
 }

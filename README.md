@@ -1,114 +1,136 @@
 # laira
 
-Distributed Discord replacement — see [PLAN.md](PLAN.md) for the product and
-engineering plan. Current state: **M0 vertical proof** (section 19 of the plan).
+**A self-hostable, end-to-end encrypted voice and screen/game streaming
+platform** — the streaming half of a Discord replacement, built so that the
+server that relays your media can never see it.
 
-## M0 scope
+> **Status: pre-alpha.** The media and membership core work end to end
+> (native desktop ⇄ SFU ⇄ browser), but there is no chat, no file sharing, no
+> recovery, and no security audit. See [SECURITY.md](SECURITY.md) before
+> trusting it, and [PLAN.md](PLAN.md) (Portuguese) for the full roadmap.
 
-Native Wayland capture → mediasoup SFU → browser viewers, with bidirectional
-voice and per-app game audio that never includes call return.
+## What works today
 
-Stack note: media follows the **OBS model** — PipeWire capture via libpipewire
-directly, FFmpeg for encode. H.264 leaves ffmpeg as an Annex-B elementary
-stream and **Rust packetizes RTP itself** (`rtp_send`): we own the socket, see
-RTCP (RR/PLI), and have the insertion point SFrame needs. Audio still goes
-through ffmpeg's Opus + RTP muxer; VP8 stays on ffmpeg's muxer as a
-transitional path. No GStreamer dependency.
+- **Native screen + game capture on Linux/Wayland**: XDG ScreenCast portal →
+  PipeWire → FFmpeg (x264) → RTP, with per-app game audio isolated from the
+  voice call (the call's return audio never re-enters the capture).
+- **mediasoup SFU** with plain-RTP ingest for the native client and WebRTC for
+  browsers. The SFU only forwards ciphertext.
+- **End-to-end encryption with SFrame (RFC 9605)** for both video and Opus
+  audio, in the native client *and* the browser (WebRTC Encoded Transform).
+  Automated tests cover native send → browser decode for video and audio; the
+  browser microphone sender and the native `stream` command's real PipeWire
+  audio path are implemented but not yet covered by automated tests.
+- **Private communities**: an admin creates a community, issues expiring
+  invites, members join from the desktop client or a browser link. Group keys
+  are per-epoch secrets sealed to each member; removing a member re-keys the
+  group and their viewers stop within seconds.
+- **Membership-gated SFU**: peers must present a short-lived, admin-signed
+  session token.
+- Rust ⇄ browser interop tested for the crypto (Ed25519, X25519 sealing, HKDF,
+  SFrame) and for real decoded video/audio in headless Chromium.
+
+## Architecture
 
 ```
-apps/desktop   laira-desktop: portal capture + RTP ingest + return voice
-apps/web       viewer: mediasoup-client page (watch, mic, mute, stats)
-services/sfu   mediasoup + WS signaling; PlainTransport ingest for native
-crates/media   PipeWire capture (pipewire crate) + ffmpeg subprocesses
-crates/protocol  signaling message types shared with the SFU
-tests/m0       signaling + RTP forwarding + video E2E scripts
+            ┌────────────┐  invite / join / epoch / token   ┌──────────────┐
+            │ laira-     │ ───────────────────────────────▶ │ laira-control│
+            │ desktop    │                                  │ (admin,      │
+            │ (capture)  │ ◀─────── sealed epoch keys ───── │  mailbox)    │
+            └─────┬──────┘                                  └──────▲───────┘
+   SFrame-encrypted│ RTP                                            │ same API
+                  ▼                                                │
+            ┌────────────┐  ciphertext only   ┌──────────────────┐ │
+            │ mediasoup  │ ─────────────────▶ │ browser viewer   │─┘
+            │ SFU        │                    │ (apps/web)       │
+            └────────────┘                    └──────────────────┘
 ```
+
+| Path | What it is |
+| --- | --- |
+| `apps/desktop` | `laira-desktop`: capture, RTP send/receive, join, native viewer |
+| `apps/web` | Browser client (Vite + TypeScript, mediasoup-client, SFrame worker) |
+| `services/sfu` | Node/mediasoup SFU with WebSocket signaling and token auth |
+| `services/control` | `laira-control`: admin authority, invites, epochs, tokens, mailbox |
+| `crates/identity` | Identities, genesis, invites, membership, epoch key schedule |
+| `crates/media` | PipeWire capture, FFmpeg wrappers, RTP, SFrame, wire format |
+| `crates/protocol` | Signaling message types shared with the SFU |
+| `tests/` | Interop vectors and end-to-end scripts (`m0`, `m1`, `m2`, `web`) |
 
 ## Requirements
 
-`ffmpeg`, `pipewire`, `pw-record` (all stock on a desktop Linux; no plugins to
-install), Rust, Node. For LAN viewers: `LAIRA_ANNOUNCED_IP=<lan-ip>` on the SFU.
+- Linux with **PipeWire** and a Wayland compositor that provides an
+  `xdg-desktop-portal` ScreenCast backend (tested on Hyprland).
+- `ffmpeg` (with libx264 and libopus), `pw-record`.
+- Rust (stable) and a recent Node.js (developed on 26).
+- A Chromium-based browser for the web viewer (RTCRtpScriptTransform is
+  required; Chromium 153 is what the automated tests use — other browsers are
+  untested).
 
-## Run
+## Quick start
 
 ```bash
-# 1. SFU (serves the viewer too)
-cd services/sfu && npm install && node server.mjs
+cargo build                                # desktop client + control service
+(cd apps/web && npm install && npm run build)
+(cd services/sfu && npm install)           # also builds the mediasoup worker
 
-# 2. capture — start the game/app first so its audio stream exists
-cargo run -p laira-desktop -- list-audio        # find --audio-target serial
-cargo run -p laira-desktop -- stream            # portal picker appears
-#   options: --audio-target <serial> --mic <serial> --codec h264|vp8
-#            --bitrate 3000000 --sfu ws://host:4443
+# 1. Create a community (prints its id and the admin key; keep ./community private)
+target/debug/laira-control init --dir ./community
 
-# 3. viewer: open http://<sfu-host>:4443/ -> Watch -> Mic
+# 2. Run the control service and the SFU (bound to your community)
+target/debug/laira-control serve --dir ./community --bind 127.0.0.1:4500 &
+(cd services/sfu && LAIRA_COMMUNITY_ID=<community_id> LAIRA_ADMIN_KEY=<admin_key> \
+   node server.mjs)                        # also serves the web app on :4443
+
+# 3. Use the admin identity on this machine, then stream
+target/debug/laira-desktop adopt-admin --control http://127.0.0.1:4500 --dir ./community
+target/debug/laira-desktop stream --e2ee   # portal picker appears
+
+# 4. Invite a friend — they open the link in a browser and press Watch
+target/debug/laira-control invite --dir ./community --web http://<sfu-host>:4443
 ```
 
-Remote (non-localhost) mic needs HTTPS (`LAIRA_TLS_CERT`/`LAIRA_TLS_KEY`);
-watching works over plain HTTP since it does not call getUserMedia.
+Desktop members join with
+`laira-desktop join --control <url> invite.json` (create the JSON with
+`laira-control invite` without `--web`). `laira-desktop whoami` shows your
+member key, roster slot and current epoch. Revoke with
+`laira-control revoke --dir ./community <member-key>`.
 
-## M0 verification status
+Notes:
 
-- [x] Signaling: join, plain send/recv transports, produce/consume, stats
-- [x] RTP forwarding: 100 pkts in -> 102 out (2 RTCP), SSRC rewritten per consumer
-- [x] Video E2E: testsrc2 -> libx264 -> RTP -> SFU -> consume -> decoded PNG
-- [x] Per-app audio capture: `pw-record --target` taps a playback stream only
-- [x] Real portal capture + browser playback: xdg-desktop-portal-hyprland
-  picker -> PipeWire BGRA frames -> libx264 -> RTP -> SFU -> mediasoup-client
-  video in the browser. Observed ~0.8–2 Mbps at 1896x1030, damage-driven
-  capture rate ~5–50 fps
-- [x] Bidirectional voice: browser mic -> WebRtcTransport -> SFU ->
-  PlainTransport -> ffmpeg `-f pulse` playback heard on the streamer's output
-- [x] No call-return: while remote voice played, the game-audio producer RMS
-  stayed at the synthetic source's -18 dB — return audio is a separate
-  playback stream and never enters the per-app capture
-- [ ] Two viewers on other networks (same-machine verified; LAN needs
-  `LAIRA_ANNOUNCED_IP`)
+- For viewers outside localhost set `LAIRA_ANNOUNCED_IP=<reachable-ip>` on the
+  SFU and open UDP ports 40000–49999. Browser microphone access needs HTTPS
+  (`LAIRA_TLS_CERT` / `LAIRA_TLS_KEY`). Put TLS in front of the control service
+  before exposing it — see [SECURITY.md](SECURITY.md).
+- Without `LAIRA_COMMUNITY_ID` / `LAIRA_ADMIN_KEY` the SFU runs **open** (dev
+  mode, logged at startup). Without a community profile, `--e2ee` falls back to
+  a public test key and warns.
 
-## M0 gotchas discovered
+## Tests
 
-- Portal screencast is **damage-driven**: a static or disabled source emits
-  zero frames, so producer byte counts legitimately flatline — not a stall.
-  Capturing a monitor that later gets disabled (laptop lid) stops video while
-  audio keeps flowing.
-- PipeWire may negotiate a meaningless framerate (1/1). The desktop clamps it
-  to [15,120] and passes `-use_wallclock_as_timestamps 1` so RTP timestamps
-  track arrival under variable-rate capture.
-- mediasoup `PlainTransport` in `comedia` mode locks the learned remote tuple;
-  probes from a different source port are ignored (audio unaffected since each
-  track uses its own transport).
+```bash
+cargo test                                 # unit tests (identity, sframe, wire, relays)
+tests/m2/e2e.sh                            # membership + native E2EE + live rekey + revocation
+tests/web/run.sh                           # headless Chromium joins by invite, decodes E2EE video + audio
+node tests/m1/sframe-interop.mjs           # Rust ↔ WebCrypto SFrame vector
+```
 
-## Known M0 limitations
+The end-to-end scripts start their own control service and SFU on ports 4599 and
+4443, so stop any SFU you have running first. Detailed per-milestone notes and
+gotchas are in [docs/dev-notes.md](docs/dev-notes.md).
 
-- RTCP is now received and parsed on the native sender (RR/PLI/FIR logged).
-  PLI still can't force an x264 keyframe inside an ffmpeg subprocess, so
-  keyframes come from `-g` (~2 s); mid-stream joins wait for the next GOP.
-  Encoder-side control is tracked under MED-02.
-- Portal picker needs a visible desktop session.
+## Roadmap
 
-## M1: SFrame E2EE (native path verified)
+Following [PLAN.md](PLAN.md): M0 ✅ vertical proof · M1 ✅ E2EE media · **M2
+(private entry) mostly done** — remaining: OpenMLS, admin recovery, dead-drop
+transport · M3 SFU/controller failover · M4 chat, channels, roles · M5
+cooperative file transfer · M6 packaging and daily use.
 
-Verified live: `stream --e2ee` (portal capture) → AES-128-GCM SFrame per
-access unit → RTP → mediasoup → `watch --e2ee` (Rust depacketize + decrypt +
-ffplay) renders the desktop correctly.
+## Contributing
 
-- `crates/media/src/sframe.rs` — RFC 9605-style AES-128-GCM + HKDF-SHA256.
-  Header `0x03` = KID 0, 4-byte BE counter; nonce = derived salt XOR ctr.
-  Fixed test key `laira-m0-sframe!` — interop vector only, NOT key management
-  (OpenMLS is M2).
-- Encrypted wire format per AU: a real SPS NAL (decoy — mediasoup's
-  SimpleConsumer gates forwarding on NAL type 7 keyframe detection, which
-  ciphertext would hide) + a SEI-typed unit `0x66 || sframe_blob` carrying the
-  encrypted Annex-B AU. Rust `rtp_recv` depacketizes, strips `0x66`, decrypts.
-- `laira-desktop watch [--e2ee] [--dump file.h264]` — native viewer:
-  PlainTransport consumer → `rtp_recv` → ffplay (or Annex-B dump).
-- `tests/m1/sframe-interop.mjs` — Node/WebCrypto decrypts the Rust encryptor's
-  bytes (`SFRAME INTEROP OK`); `sframe-forward.mjs` — SFU forwards the format.
-- Browser insertable-streams decrypt exists (`sframe-worker.ts`) but the
-  Chrome depacketizer/transform path is still unproven (video stays black);
-  the native path is the reference implementation for now.
-- Audio is still plaintext (per-track SFrame on Opus is a later step).
-- Gotcha fixed in test-video: `-pixel_format bgra` is ignored on ffmpeg
-  rawvideo **output** (use `-pix_fmt`); it emitted yuv420p while the reader
-  expected bgra, producing a tiled grayscale encode — never caught because the
-  test was only validated by SFU byte counts, not visually.
+Issues and pull requests are welcome. For anything security-relevant, follow
+[SECURITY.md](SECURITY.md) instead of opening a public issue.
+
+## License
+
+[MIT](LICENSE) © 2026 enrell

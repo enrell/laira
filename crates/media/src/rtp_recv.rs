@@ -24,7 +24,6 @@ fn big_rcvbuf(sock: &UdpSocket) {
 }
 
 const NAL_SPS: u8 = 7;
-const NAL_SEI_BLOB: u8 = 6; // type 6 (SEI) used as the opaque SFrame carrier
 const NAL_FU_A: u8 = 28;
 const NAL_FU_B: u8 = 29;
 const START: &[u8] = &[0, 0, 0, 1];
@@ -61,7 +60,7 @@ fn depacketize(pay: &[u8], fu: &mut Option<(u8, Vec<u8>)>, nals: &mut Vec<Vec<u8
 }
 
 /// Blocking receive loop: reads RTP from `sock`, emits Annex-B to `out`.
-/// If `dec` is set, 0x66-marked blob units are SFrame-decrypted; a blob that
+/// If `dec` is set, blob units (crate::wire) are SFrame-decrypted; a blob that
 /// fails to decrypt is dropped (wrong key / corrupt) — passthrough NALs are
 /// emitted regardless, so a plaintext producer works with `dec` set too.
 /// `want_ssrc`: the consumer's SSRC from consumePlain rtpParameters — foreign
@@ -119,16 +118,17 @@ pub fn h264_recv_loop(
                 let mut nals = Vec::new();
                 for (_, pay) in fr.pkts { depacketize(&pay, &mut fu, &mut nals); }
                 for nal in nals {
-                    let is_blob = nal.len() > 6 && nal[0] == 0x66 && nal[1] == 0x03;
-                    if is_blob {
-                        if let Some(d) = dec.as_mut() {
-                            match d.decrypt(&nal[1..]) {
+                    // Blob NALs (see crate::wire) are only recognised when we can
+                    // decrypt; plaintext producers still pass through untouched.
+                    if let Some(d) = dec.as_mut() {
+                        if let Some(sf) = crate::wire::parse_blob(&nal) {
+                            match d.decrypt(&sf) {
                                 // plaintext is Annex-B already — write as-is
                                 Ok(pt) => { let _ = out.write_all(&pt); }
                                 Err(e) => tracing::warn!(%e, "sframe decrypt failed"),
                             }
+                            continue;
                         }
-                        continue;
                     }
                     let _ = out.write_all(START);
                     let _ = out.write_all(&nal);

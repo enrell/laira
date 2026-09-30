@@ -4,7 +4,8 @@
 
 import { Device } from 'mediasoup-client';
 import type { Transport, Consumer, Producer } from 'mediasoup-client/lib/types';
-import type { RtpCapabilities, RtpParameters } from 'mediasoup-client/lib/RtpParameters';
+import type { RtpCapabilities } from 'mediasoup-client/lib/RtpParameters';
+import { Member, EpochKeys, unhex, type InviteBundle } from './laira';
 
 const statusEl = document.getElementById('status')!;
 const logEl = document.getElementById('log')!;
@@ -60,22 +61,108 @@ function req(method: string, params: any = {}): Promise<any> {
 
 // ---- mediasoup ----
 
-// M1 E2EE vector: ?e2ee attaches the SFrame transform (RFC 9605 AES-GCM) to
-// every receiver and to the mic sender. Key is the fixed test vector shared
-// with the native client; real key management arrives with MLS in M2.
-const e2ee = new URLSearchParams(location.search).has('e2ee');
+// E2EE: every receiver gets an SFrame decrypt transform whose per-sender keys
+// come from the community epoch (laira.ts). There is no fixed key any more.
 let sframeWorker: Worker | undefined;
-function sframeTransform(mode: 'encrypt' | 'decrypt'): any {
+function getWorker(): Worker {
   if (!sframeWorker) {
     sframeWorker = new Worker(new URL('./sframe-worker.ts', import.meta.url), { type: 'module' });
     sframeWorker.onmessage = (e) => {
       if (e.data?.sframeFormat) log(e.data.sframeFormat);
       const s = e.data?.sframe;
-      if (s) log(`sframe: ${s.ok} ok / ${s.dropped} dropped${s.firstErr ? ' err=' + s.firstErr : ''}`);
+      if (s) {
+        log(`sframe: ${s.ok} ok / ${s.dropped} dropped${s.firstErr ? ' err=' + s.firstErr : ''}`);
+        (window as any).__sframeStats = s;
+      }
     };
   }
+  return sframeWorker;
+}
+function sframeTransform(mode: 'encrypt' | 'decrypt', kind: 'video' | 'audio' = 'video'): any {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return new (window as any).RTCRtpScriptTransform(sframeWorker, { mode });
+  return new (window as any).RTCRtpScriptTransform(getWorker(), { mode, kind });
+}
+// Chromium only applies a receiver transform that is set while the remote
+// description is being applied (the `track` event); assigning it after
+// consume() returns is silently ignored. mediasoup-client owns its
+// RTCPeerConnection, so wrap the constructor to attach the decrypt transform
+// to every incoming video receiver at that moment.
+(() => {
+  const Native = window.RTCPeerConnection;
+  if (!(window as any).RTCRtpScriptTransform) return;
+  window.RTCPeerConnection = class extends Native {
+    constructor(...args: ConstructorParameters<typeof RTCPeerConnection>) {
+      super(...args);
+      this.addEventListener('track', (ev) => {
+        const kind = ev.track.kind as 'video' | 'audio';
+        (ev.receiver as any).transform = sframeTransform('decrypt', kind);
+        log(`sframe decrypt transform attached to ${kind} receiver`);
+      });
+    }
+    // Outgoing mic: encrypt at the sender, set at creation (same timing rule).
+    addTransceiver(...args: Parameters<RTCPeerConnection['addTransceiver']>) {
+      const t = super.addTransceiver(...args);
+      const kind = typeof args[0] === 'string' ? args[0] : args[0].kind;
+      if (kind === 'audio') (t.sender as any).transform = sframeTransform('encrypt', 'audio');
+      return t;
+    }
+  } as typeof RTCPeerConnection;
+})();
+
+function pushKeys(k: EpochKeys) {
+  getWorker().postMessage({ type: 'keys', kid: k.kid, senders: k.senders() });
+}
+
+// ---- community membership ----
+
+const STORE = 'laira.member.v1';
+let member: Member | undefined;
+
+function loadMember(): Member | undefined {
+  try { const j = localStorage.getItem(STORE); return j ? Member.restore(JSON.parse(j)) : undefined; }
+  catch { return undefined; }
+}
+
+/** Invite links look like `#c=<control url>&i=<hex of InviteBundle JSON>`. */
+async function joinFromHash(): Promise<void> {
+  const h = new URLSearchParams(location.hash.slice(1));
+  const c = h.get('c'), i = h.get('i');
+  if (!c || !i) return;
+  history.replaceState(null, '', location.pathname + location.search); // don't leave the secret in the URL bar
+  const invite: InviteBundle = JSON.parse(new TextDecoder().decode(unhex(i)));
+  member = await Member.join(c, invite);
+  try { localStorage.setItem(STORE, JSON.stringify(member.export())); } catch { /* private mode */ }
+  log(`joined community ${member.communityId.slice(0, 8)} as ${member.pubHex.slice(0, 8)}`);
+}
+
+const EPOCH_POLL_MS = 3000, GRACE_MS = 15000, TOKEN_REFRESH_MS = 120000;
+let removed = false;
+
+function startEpochPoller(m: Member, first: EpochKeys) {
+  let epoch = first.epoch;
+  setInterval(async () => {
+    if (removed) return;
+    try {
+      const k = await m.latestEpoch();
+      if (k.epoch > epoch) {
+        epoch = k.epoch; pushKeys(k);
+        log(`sframe: rekeyed to epoch ${epoch}`);
+        setTimeout(() => getWorker().postMessage({ type: 'forget-previous' }), GRACE_MS);
+      }
+    } catch (e) {
+      if (String(e).includes('cannot open')) leave('removed from the community');
+      else log(`epoch poll failed: ${e}`);
+    }
+  }, EPOCH_POLL_MS);
+}
+
+function leave(why: string) {
+  removed = true;
+  statusEl.textContent = why;
+  log(why);
+  for (const c of consumers.values()) c.close();
+  consumers.clear();
+  ws.close();
 }
 
 const device = new Device();
@@ -85,6 +172,7 @@ let sendTransport: Transport | undefined;
 let micProducer: Producer | undefined;
 let micStream: MediaStream | undefined;
 const consumers = new Map<string, Consumer>();
+(window as any).__consumers = { [Symbol.iterator]: () => consumers.values() }; // test hook
 
 interface ProducerInfo { producerId: string; kind: string; appData: any; peerId: string }
 
@@ -99,8 +187,15 @@ async function makeTransport(kind: 'send' | 'recv'): Promise<Transport> {
   return t;
 }
 
+const consuming = new Set<string>(); // in-flight: join() and newProducer can race for the same producer
+
 async function consume(p: ProducerInfo) {
-  if (consumers.has(p.producerId)) return;
+  if (consumers.has(p.producerId) || consuming.has(p.producerId)) return;
+  consuming.add(p.producerId);
+  try { await consumeOnce(p); } finally { consuming.delete(p.producerId); }
+}
+
+async function consumeOnce(p: ProducerInfo) {
   if (p.peerId === myPeerId) return; // never hear our own mic back
   if (!recvTransport) recvTransport = await makeTransport('recv');
   const c = await req('consume', {
@@ -111,12 +206,7 @@ async function consume(p: ProducerInfo) {
   const consumer = await recvTransport!.consume({
     id: c.consumerId, producerId: c.producerId, kind: c.kind, rtpParameters: c.rtpParameters,
   });
-  // M1 vector is video-only: audio still goes through ffmpeg's muxer on the
-  // native side (no SFrame there yet) and the native receiver can't decrypt.
-  if (e2ee && consumer.kind === 'video' && (consumer as any).rtpReceiver) {
-    (consumer as any).rtpReceiver.transform = sframeTransform('decrypt');
-    log(`sframe decrypt on ${p.kind}`);
-  }
+  (window as any).__pc = (recvTransport as any)._handler?._pc; // test hook
   consumers.set(p.producerId, consumer);
   await req('resumeConsumer', { consumerId: c.consumerId });
   attach(consumer, p);
@@ -168,7 +258,17 @@ function detachProducer(producerId: string) {
 }
 
 async function watch() {
-  const { peerId, rtpCapabilities, producers } = await req('join');
+  if (!member) throw new Error('no membership — open an invite link first');
+  const first = await member.latestEpoch();
+  pushKeys(first);
+  const { peerId, rtpCapabilities, producers } = await req('join', { token: await member.sessionToken() });
+  const m = member;
+  setInterval(() => {
+    if (removed) return;
+    m.sessionToken().then((token) => req('refreshToken', { token }))
+      .catch((e) => { if (String(e).includes('403')) leave('session refused: removed'); else log(`token refresh failed: ${e}`); });
+  }, TOKEN_REFRESH_MS);
+  startEpochPoller(m, first);
   myPeerId = peerId;
   await device.load({ routerRtpCapabilities: rtpCapabilities as RtpCapabilities });
   for (const p of producers) await consume(p);
@@ -205,8 +305,6 @@ async function toggleMic() {
   }
   const track = micStream.getAudioTracks()[0];
   micProducer = await sendTransport.produce({ track });
-  // mic stays plaintext in the M1 vector — the native receiver has no SFrame
-  // decrypt path yet.
   micBtn.textContent = 'Mic: on'; muteBtn.disabled = false;
   log('mic on');
 }
@@ -230,6 +328,7 @@ function startStats() {
       let pkts = 0, fRecv = 0, fDec = 0, fDrop = 0;
       for (const s of stats.values() as any) {
         if (s.type === 'inbound-rtp') {
+          (window as any).__inbound = s; // test hook
           bitrate = (s.bitrate || 0) / 1000;
           pkts = s.packetsReceived || 0;
           fRecv = s.framesReceived || 0;
@@ -259,4 +358,4 @@ watchBtn.onclick = async () => {
 micBtn.onclick = () => toggleMic().catch(e => log(`mic error: ${e}`));
 muteBtn.onclick = () => toggleMute().catch(e => log(`mute error: ${e}`));
 
-connect();
+joinFromHash().catch((e) => log(`join failed: ${e}`)).finally(() => { member ??= loadMember(); connect(); });

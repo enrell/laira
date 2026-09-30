@@ -3,15 +3,24 @@
 // senders. Mirrors crates/media/src/sframe.rs exactly:
 //   key  = HKDF-SHA256(base, salt="SFrame 1.0", info="key")  -> 16B
 //   salt = HKDF-SHA256(base, salt="SFrame 1.0", info="salt") -> 12B
-//   wire = cfg(0x03: kid=0, ctr_len=4) || ctr4BE || ct || tag(16)
+//   wire = cfg((kid<<4)|3) || ctr4BE || ct || tag(16)
 //   nonce = salt XOR ctr12 ; aad = header bytes
 //
-// M1 test vector: fixed base key, same as TEST_BASE_KEY in Rust.
+// Keys: per-sender, derived from the community epoch (see laira.ts).
 
 const te = new TextEncoder();
-const BASE_KEY = te.encode('laira-m0-sframe!'); // 16 bytes — test vector only
 
-async function derive(baseKey: Uint8Array) {
+// Per-sender keys arrive from the page (derived from the community epoch);
+// nothing is hardcoded. `previous` keeps the outgoing epoch until the page
+// clears it so frames in flight across a rekey still decode.
+interface Ctx { key: CryptoKey; salt: Uint8Array }
+let current = new Map<number, Ctx>();
+let previous = new Map<number, Ctx>();
+let sendKid = 0;
+let sendCtx: Ctx | undefined;
+const sendCtr = { c: 0 };
+
+async function derive(baseKey: Uint8Array): Promise<Ctx> {
   const ikm = await crypto.subtle.importKey('raw', baseKey as BufferSource, 'HKDF', false, ['deriveBits']);
   const keyBits = await crypto.subtle.deriveBits(
     { name: 'HKDF', hash: 'SHA-256', salt: te.encode('SFrame 1.0'), info: te.encode('key') }, ikm, 128);
@@ -27,6 +36,23 @@ function nonceFor(salt: Uint8Array, ctr: bigint | number): Uint8Array {
   for (let i = 11; i >= 4 && c > 0n; i--) { n[i] ^= Number(c & 0xffn); c >>= 8n; }
   return n;
 }
+
+// Page -> worker: {type:'keys', kid, senders:[[kid, base]]} rotates to a new
+// epoch; {type:'forget-previous'} ends the grace period.
+self.addEventListener('message', async (e: MessageEvent) => {
+  const m = e.data;
+  if (m?.type === 'keys') {
+    const next = new Map<number, Ctx>();
+    for (const [kid, base] of m.senders as [number, Uint8Array][]) next.set(kid, await derive(base));
+    previous = current;
+    current = next;
+    sendKid = m.kid;
+    sendCtx = next.get(m.kid);
+    sendCtr.c = 0; // new key, fresh counter
+  } else if (m?.type === 'forget-previous') {
+    previous = new Map();
+  }
+});
 
 let loggedFormat = false;
 let loggedPlain = false;
@@ -55,16 +81,61 @@ function annexBUnits(data: Uint8Array): { raw: Uint8Array; nal: Uint8Array }[] {
   }));
 }
 
-// Our encrypted blob marker: SEI NAL (0x66) carrying cfg byte 0x03.
-const isBlob = (nal: Uint8Array) => nal.length > 6 && nal[0] === 0x66 && nal[1] === 0x03;
+// Wire format v2 (crates/media/src/wire.rs): blob = slice-typed NAL (1 or 5)
+// whose unescaped payload is PREFIX || sframe || 0x80.
+const PREFIX = [0x88, 0x80, 0x4c, 0x32];
 
-async function decryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame, ctx: Awaited<ReturnType<typeof derive>>) {
+function unescape(d: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  let zeros = 0;
+  for (const b of d) {
+    if (zeros >= 2 && b === 3) { zeros = 0; continue; }
+    out.push(b);
+    zeros = b === 0 ? zeros + 1 : 0;
+  }
+  return Uint8Array.from(out);
+}
+
+/** SFrame buffer inside a blob NAL, or undefined if this NAL isn't one. */
+function blobPayload(nal: Uint8Array): Uint8Array | undefined {
+  const t = nal[0] & 0x1f;
+  if (t !== 1 && t !== 5) return undefined;
+  const body = unescape(nal.subarray(1));
+  if (body.length < PREFIX.length + 22 || body[body.length - 1] !== 0x80) return undefined;
+  if (!PREFIX.every((v, i) => body[i] === v)) return undefined;
+  return body.slice(PREFIX.length, body.length - 1);
+}
+
+/** Audio: the whole Opus payload is the SFrame buffer (crates/media/src/rtp_relay.rs). */
+async function decryptAudio(frame: RTCEncodedAudioFrame) {
+  const blob = new Uint8Array(frame.data);
+  const cfg = blob[0];
+  const ctrLen = (cfg & 0x0f) + 1;
+  let ctr = 0;
+  for (let i = 0; i < ctrLen; i++) ctr = ctr * 256 + blob[1 + i];
+  const kid = (cfg >> 4) & 0x07;
+  const aad = blob.slice(0, 1 + ctrLen);
+  const attempt = (ctx: Ctx | undefined) => {
+    if (!ctx) throw new Error(`no key for kid ${kid}`);
+    return crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: nonceFor(ctx.salt, ctr) as BufferSource, additionalData: aad as BufferSource, tagLength: 128 },
+      ctx.key, blob.slice(1 + ctrLen) as BufferSource);
+  };
+  let pt: ArrayBuffer;
+  try { pt = await attempt(current.get(kid)); }
+  catch (err) { pt = await attempt(previous.get(kid)).catch(() => { throw err; }); }
+  frame.data = pt;
+  return frame;
+}
+
+async function decryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame) {
   const data = new Uint8Array(frame.data);
   const units = annexBUnits(data);
   // Encrypted AUs arrive as [SPS decoy][SEI-typed 0x66 + sframe blob]; the SPS
   // decoy exists to pass the SFU's keyframe gate. Plaintext frames have no
   // 0x66 unit -> passthrough.
-  if (!units.some(u => isBlob(u.nal))) {
+  const blobs = units.map((u) => blobPayload(u.nal));
+  if (!blobs.some(Boolean)) {
     if (!loggedFormat) {
       loggedFormat = true;
       const hex = [...data.slice(0, 32)].map(x => x.toString(16).padStart(2, '0')).join(' ');
@@ -74,16 +145,23 @@ async function decryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame, 
   }
   logFormat('rx-wire', data);
   const out: Uint8Array[] = [];
-  for (const u of units) {
-    if (!isBlob(u.nal)) { out.push(u.raw); continue } // SPS decoy & friends pass through
-    const blob = u.nal.slice(1);
+  for (const blob of blobs) {
+    if (!blob) continue; // real SPS/PPS ahead of the blob: the plaintext AU repeats them
     const cfg = blob[0];
     const ctrLen = (cfg & 0x0f) + 1;
     let ctr = 0;
     for (let i = 0; i < ctrLen; i++) ctr = ctr * 256 + blob[1 + i];
-    const pt = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: nonceFor(ctx.salt, ctr) as BufferSource, additionalData: blob.slice(0, 1 + ctrLen) as BufferSource, tagLength: 128 },
-      ctx.key, blob.slice(1 + ctrLen) as BufferSource);
+    const kid = (cfg >> 4) & 0x07;
+    const aad = blob.slice(0, 1 + ctrLen);
+    const attempt = async (ctx: Ctx | undefined) => {
+      if (!ctx) throw new Error(`no key for kid ${kid}`);
+      return crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: nonceFor(ctx.salt, ctr) as BufferSource, additionalData: aad as BufferSource, tagLength: 128 },
+        ctx.key, blob.slice(1 + ctrLen) as BufferSource);
+    };
+    let pt: ArrayBuffer;
+    try { pt = await attempt(current.get(kid)); }
+    catch (err) { pt = await attempt(previous.get(kid)).catch(() => { throw err; }); }
     out.push(new Uint8Array(pt)); // plaintext is already Annex-B
   }
   const total = out.reduce((s, b) => s + b.length, 0);
@@ -99,15 +177,16 @@ async function decryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame, 
   return frame;
 }
 
-async function encryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame, ctx: Awaited<ReturnType<typeof derive>>, ctrBox: { c: number }) {
+async function encryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame) {
+  if (!sendCtx) throw new Error('no send key');
   const data = new Uint8Array(frame.data);
-  const ctr = ctrBox.c++;
+  const ctr = sendCtr.c++;
   const header = new Uint8Array(1 + 4);
-  header[0] = 0x03;
+  header[0] = (sendKid << 4) | 0x03;
   new DataView(header.buffer).setUint32(1, ctr >>> 0);
   const ct = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: nonceFor(ctx.salt, ctr) as BufferSource, additionalData: header as BufferSource, tagLength: 128 },
-    ctx.key, data as BufferSource));
+    { name: 'AES-GCM', iv: nonceFor(sendCtx.salt, ctr) as BufferSource, additionalData: header as BufferSource, tagLength: 128 },
+    sendCtx.key, data as BufferSource));
   const out = new Uint8Array(header.length + ct.length);
   out.set(header); out.set(ct, header.length);
   frame.data = out.buffer;
@@ -115,8 +194,6 @@ async function encryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame, 
 }
 
 // The transform runs in a dedicated worker context (RTCRtpScriptTransform).
-const ctxPromise = derive(BASE_KEY);
-const sendCtr = { c: 0 };
 const stats = { ok: 0, dropped: 0, firstErr: '' };
 setInterval(() => {
   if (stats.ok || stats.dropped) (self as any).postMessage({ sframe: stats });
@@ -126,12 +203,14 @@ setInterval(() => {
 (self as any).onrtctransform = (event: any) => {
   const transformer = event.transformer;
   const mode = transformer.options?.mode || 'decrypt';
+  const kind = transformer.options?.kind || 'video';
   transformer.readable
     .pipeThrough(new TransformStream({
       async transform(frame, controller) {
         try {
-          if (mode === 'encrypt') controller.enqueue(await encryptFrame(frame, await ctxPromise, sendCtr));
-          else controller.enqueue(await decryptFrame(frame, await ctxPromise));
+          if (mode === 'encrypt') controller.enqueue(await encryptFrame(frame));
+          else if (kind === 'audio') controller.enqueue(await decryptAudio(frame as RTCEncodedAudioFrame));
+          else controller.enqueue(await decryptFrame(frame));
           stats.ok++;
         } catch (e) {
           // Drop undecryptable frames — wrong key or non-SFrame sender.
@@ -140,5 +219,6 @@ setInterval(() => {
         }
       },
     }))
-    .pipeTo(transformer.writable);
+    .pipeTo(transformer.writable)
+    .catch((e: any) => (self as any).postMessage({ sframeFormat: `transform pipe error ${e}` }));
 };

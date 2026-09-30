@@ -15,7 +15,9 @@ pub mod pw;
 pub mod rtp;
 pub mod rtp_recv;
 pub mod rtp_send;
+pub mod rtp_relay;
 pub mod sframe;
+pub mod wire;
 
 /// Where an RTP stream goes on the SFU, plus the wire identity we fix
 /// (payload type + SSRC) so mediasoup `produce` matches bit-for-bit.

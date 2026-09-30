@@ -22,11 +22,16 @@ const key = await crypto.subtle.importKey('raw', keyBits, { name: 'AES-GCM' }, f
 const salt = new Uint8Array(saltBits);
 
 const data = hex(v.ciphertext);
-// wire format = Annex-B unit: 00 00 00 01 || 0x66 (SEI marker) || sframe blob
-if (!(data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && data[4] === 0x66)) {
-  console.error('missing Annex-B + 0x66 wire prefix'); process.exit(1)
+// wire = Annex-B start code || blob NAL (crates/media/src/wire.rs):
+//   header(0x65 keyframe form) || escape(PREFIX 88 80 'L' '2' || sframe || 0x80)
+if (!(data[0] === 0 && data[1] === 0 && data[2] === 0 && data[3] === 1 && (data[4] & 0x1f) === 5)) {
+  console.error('missing Annex-B + IDR-typed blob NAL'); process.exit(1)
 }
-const blob = data.slice(5); // same as sframe-worker.ts blob extraction
+function unescape(d) { const o = []; let z = 0; for (const b of d) { if (z >= 2 && b === 3) { z = 0; continue } o.push(b); z = b === 0 ? z + 1 : 0 } return Uint8Array.from(o) }
+const body = unescape(data.slice(5));
+const PREFIX = [0x88, 0x80, 0x4c, 0x32];
+if (!PREFIX.every((x, i) => body[i] === x) || body[body.length - 1] !== 0x80) { console.error('bad blob prefix/stop byte'); process.exit(1) }
+const blob = body.slice(PREFIX.length, body.length - 1); // same as sframe-worker.ts blobPayload
 const cfg = blob[0];
 const ctrLen = (cfg & 0x0f) + 1;
 let ctr = 0;

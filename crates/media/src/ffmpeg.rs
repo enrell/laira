@@ -167,6 +167,20 @@ pub fn audio_capture(target_serial: Option<u64>) -> Result<Child> {
     Ok(child)
 }
 
+/// Synthetic 440 Hz stereo tone as raw s16le/48k on stdout (test source that
+/// stands in for pw-record; returned as a Child so callers treat it the same).
+pub fn audio_tone() -> Result<Child> {
+    base(&mut Command::new("ffmpeg"))
+        .args([
+            "-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+            "-ac", "2", "-f", "s16le", "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawn ffmpeg tone")
+}
+
 /// Play one remote Opus RTP stream through the local default output.
 /// The SDP hands ffmpeg the payload-type mapping for the dynamic PT.
 pub fn audio_player(listen_port: u16, payload_type: u8, ssrc: u32, label: &str) -> Result<Child> {
