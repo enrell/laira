@@ -64,6 +64,12 @@ pub enum Error {
     NotInRoster,
     #[error("too many members for one SFrame domain (max 8)")]
     RosterFull,
+    #[error("recovery has too few valid guardian signatures")]
+    RecoveryUnderSigned,
+    #[error("recovery does not extend the current chain head")]
+    RecoveryOutOfOrder,
+    #[error("conflicting recoveries: chain frozen")]
+    RecoveryFork,
     #[error("not the admin authority")]
     NotAdmin,
 }
@@ -137,6 +143,32 @@ impl Canon {
 }
 
 pub type CommunityId = [u8; 32];
+
+/// What a verifier needs to accept admin-signed objects: the community and
+/// its *current* admin (genesis admin, or the head of the recovery chain).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trust {
+    pub community_id: CommunityId,
+    pub admin: PublicKey,
+}
+
+impl From<&Genesis> for Trust {
+    fn from(g: &Genesis) -> Self {
+        Trust { community_id: g.community_id(), admin: g.admin }
+    }
+}
+
+impl From<&Trust> for Trust {
+    fn from(t: &Trust) -> Self {
+        *t
+    }
+}
+
+impl From<&RecoveryChain> for Trust {
+    fn from(c: &RecoveryChain) -> Self {
+        Trust { community_id: c.genesis.community_id(), admin: c.admin }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -224,11 +256,12 @@ impl Invite {
             .done()
     }
 
-    pub fn verify(&self, genesis: &Genesis) -> Result<()> {
-        if self.community_id != genesis.community_id() {
+    pub fn verify<'a>(&self, trust: impl Into<Trust>) -> Result<()> {
+        let t = trust.into();
+        if self.community_id != t.community_id {
             return Err(Error::WrongCommunity);
         }
-        genesis.admin.verify(&self.body(), &self.signature)
+        t.admin.verify(&self.body(), &self.signature)
     }
 }
 
@@ -356,6 +389,8 @@ pub struct Authority {
     epoch: u64,
     kids: HashMap<PublicKey, u8>,
     latest_epoch: Option<EpochBundle>,
+    chain: RecoveryChain,
+    recoveries: Vec<AdminRecovery>,
 }
 
 /// Serializable authority state (the admin's identity seed is stored
@@ -378,6 +413,24 @@ pub struct AuthoritySnapshot {
     revoked: Vec<PublicKey>,
     kids: Vec<(PublicKey, u8)>,
     latest_epoch: Option<EpochBundle>,
+    #[serde(default)]
+    recoveries: Vec<AdminRecovery>,
+}
+
+impl AuthoritySnapshot {
+    pub fn community_id(&self) -> CommunityId {
+        self.genesis.community_id()
+    }
+
+    /// Head of the recovery chain and the number of applied recoveries, for
+    /// proposing the next one without needing the (possibly lost) admin key.
+    pub fn recovery_state(&self) -> Result<([u8; 32], u64)> {
+        let mut chain = RecoveryChain::new(self.genesis.clone())?;
+        for r in &self.recoveries {
+            chain.apply(r)?;
+        }
+        Ok((chain.head(), chain.generation()))
+    }
 }
 
 impl Authority {
@@ -392,11 +445,40 @@ impl Authority {
             revoked: self.revoked.iter().copied().collect(),
             kids: self.kids.iter().map(|(k, v)| (*k, *v)).collect(),
             latest_epoch: self.latest_epoch.clone(),
+            recoveries: self.recoveries.clone(),
         }
     }
 
     pub fn restore(id: Identity, snap: AuthoritySnapshot) -> Result<Self> {
-        let mut a = Self::new(id, snap.genesis)?;
+        Self::restore_with(id, snap, None)
+    }
+
+    /// Rebuild the authority for the *new* admin from a saved state and a
+    /// guardian-signed recovery, without needing the lost admin key. Members'
+    /// certificates are re-signed and a fresh epoch is issued.
+    pub fn recover_from(snap: AuthoritySnapshot, r: &AdminRecovery, new_admin: Identity) -> Result<(Self, EpochBundle)> {
+        let mut a = Self::restore_with(new_admin, snap, Some(r))?;
+        a.reissue_memberships();
+        let e = a.new_epoch()?;
+        Ok((a, e))
+    }
+
+    fn restore_with(id: Identity, mut snap: AuthoritySnapshot, extra: Option<&AdminRecovery>) -> Result<Self> {
+        let mut chain = RecoveryChain::new(snap.genesis.clone())?;
+        for r in &snap.recoveries {
+            chain.apply(r)?;
+        }
+        if let Some(r) = extra {
+            if chain.head() != r.head() {
+                chain.apply(r)?;
+                snap.recoveries.push(r.clone());
+            }
+        }
+        if chain.admin() != id.public() {
+            return Err(Error::NotAdmin);
+        }
+        let mut a = Self::with_chain(id, snap.genesis, chain);
+        a.recoveries = snap.recoveries;
         a.seq = snap.seq;
         a.epoch = snap.epoch;
         a.invites = snap.invites.into_iter()
@@ -409,12 +491,21 @@ impl Authority {
         Ok(a)
     }
 
+    fn reissue_memberships(&mut self) {
+        let mut certs: Vec<MembershipCert> = self.members.values().cloned().collect();
+        for c in &mut certs {
+            c.signature = self.id.sign(&c.body());
+            self.members.insert(c.member, c.clone());
+        }
+    }
+
     pub fn latest_epoch(&self) -> Option<&EpochBundle> {
         self.latest_epoch.as_ref()
     }
 
     /// Issue a session token to a current member who proves key possession.
     pub fn issue_token(&self, req: &TokenRequest, now: u64) -> Result<SessionToken> {
+        self.require_admin()?;
         if req.community_id != self.genesis.community_id() {
             return Err(Error::WrongCommunity);
         }
@@ -430,16 +521,61 @@ impl Authority {
         Ok(t)
     }
 
+    /// Who verifiers should currently trust (follows the recovery chain).
+    pub fn trust(&self) -> Trust {
+        Trust::from(&self.chain)
+    }
+
+    pub fn recoveries(&self) -> &[AdminRecovery] {
+        &self.recoveries
+    }
+
+    pub fn recovery_head(&self) -> [u8; 32] {
+        self.chain.head()
+    }
+
+    /// Accept a guardian-signed recovery. If it names `new_identity` as the
+    /// new admin this authority becomes that admin: memberships are
+    /// re-signed under the new key (same seq) and a fresh epoch is issued so
+    /// the previous admin, who knew the old epoch secret, is locked out.
+    /// Otherwise the authority stays as-is but stops being able to sign
+    /// (`NotAdmin`): the old admin is no longer the admin.
+    pub fn apply_recovery(&mut self, r: &AdminRecovery, new_identity: Option<Identity>) -> Result<Option<EpochBundle>> {
+        let before = self.chain.head();
+        self.chain.apply(r)?;
+        if self.chain.head() == before {
+            return Ok(None); // already applied
+        }
+        self.recoveries.push(r.clone());
+        let Some(id) = new_identity else { return Ok(None) };
+        if id.public() != r.new_admin {
+            return Err(Error::NotAdmin);
+        }
+        self.id = id;
+        self.reissue_memberships();
+        self.new_epoch().map(Some)
+    }
+
+    fn require_admin(&self) -> Result<()> {
+        if self.id.public() == self.chain.admin() { Ok(()) } else { Err(Error::NotAdmin) }
+    }
+
     pub fn is_member(&self, m: &PublicKey) -> bool {
-        *m == self.genesis.admin || self.members.contains_key(m)
+        *m == self.chain.admin() || self.members.contains_key(m)
     }
 
     pub fn new(id: Identity, genesis: Genesis) -> Result<Self> {
-        genesis.verify()?;
-        if genesis.admin != id.public() {
+        let chain = RecoveryChain::new(genesis.clone())?;
+        if chain.admin() != id.public() {
             return Err(Error::NotAdmin);
         }
-        Ok(Self {
+        Ok(Self::with_chain(id, genesis, chain))
+    }
+
+    fn with_chain(id: Identity, genesis: Genesis, chain: RecoveryChain) -> Self {
+        Self {
+            chain,
+            recoveries: Vec::new(),
             id,
             genesis,
             seq: 0,
@@ -449,7 +585,7 @@ impl Authority {
             epoch: 0,
             kids: HashMap::new(),
             latest_epoch: None,
-        })
+        }
     }
 
     pub fn genesis(&self) -> &Genesis {
@@ -478,6 +614,7 @@ impl Authority {
     /// Validate a join request and issue a membership certificate.
     /// Re-admitting an existing member is idempotent and consumes no use.
     pub fn admit(&mut self, req: &JoinRequest, now: u64) -> Result<MembershipCert> {
+        self.require_admin()?;
         if req.community_id != self.genesis.community_id() {
             return Err(Error::WrongCommunity);
         }
@@ -522,8 +659,9 @@ impl Authority {
     /// KID slots are sticky within a community lifetime and never reused
     /// while the member is present; freed slots are recycled.
     pub fn new_epoch(&mut self) -> Result<EpochBundle> {
+        self.require_admin()?;
         let cid = self.genesis.community_id();
-        let mut who: Vec<PublicKey> = vec![self.genesis.admin];
+        let mut who: Vec<PublicKey> = vec![self.chain.admin()];
         let mut members: Vec<&MembershipCert> = self.members.values().collect();
         members.sort_by_key(|c| c.seq);
         who.extend(members.iter().map(|c| c.member));
@@ -572,7 +710,7 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// admin-signed certificates and revocations. Highest `seq` per member wins,
 /// so delivery order and duplicates don't matter.
 pub struct MembershipView {
-    genesis: Genesis,
+    trust: Trust,
     // member -> (seq, Some(role) if member, None if revoked)
     state: HashMap<PublicKey, (u64, Option<Role>)>,
 }
@@ -580,7 +718,12 @@ pub struct MembershipView {
 impl MembershipView {
     pub fn new(genesis: Genesis) -> Result<Self> {
         genesis.verify()?;
-        Ok(Self { genesis, state: HashMap::new() })
+        Ok(Self { trust: Trust::from(&genesis), state: HashMap::new() })
+    }
+
+    /// Follow a recovery: from now on certs must be signed by the new admin.
+    pub fn set_trust(&mut self, trust: Trust) {
+        self.trust = trust;
     }
 
     pub fn apply_cert(&mut self, c: &MembershipCert) -> Result<()> {
@@ -596,10 +739,10 @@ impl MembershipView {
     }
 
     fn check(&self, cid: CommunityId, body: &[u8], sig: &[u8; 64]) -> Result<()> {
-        if cid != self.genesis.community_id() {
+        if cid != self.trust.community_id {
             return Err(Error::WrongCommunity);
         }
-        self.genesis.admin.verify(body, sig)
+        self.trust.admin.verify(body, sig)
     }
 
     fn put(&mut self, m: PublicKey, seq: u64, role: Option<Role>) {
@@ -660,6 +803,127 @@ impl EpochSecret {
     }
 }
 
+// ------------------------------------------------------- admin recovery
+
+/// A recovery guardian's signature over a recovery body.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardianSig {
+    pub guardian: PublicKey,
+    #[serde(with = "hexser")]
+    pub signature: [u8; 64],
+}
+
+/// Replaces the admin key. Signed by at least `recovery_threshold` distinct
+/// guardians listed in the genesis (PLAN §11). Guardians persist what they
+/// signed and never sign two recoveries with the same `previous_head`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRecovery {
+    #[serde(with = "hexser")]
+    pub community_id: CommunityId,
+    /// Head of the recovery chain this extends (community id for the first).
+    #[serde(with = "hexser")]
+    pub previous_head: [u8; 32],
+    pub generation: u64,
+    pub new_admin: PublicKey,
+    pub signatures: Vec<GuardianSig>,
+}
+
+impl AdminRecovery {
+    pub fn propose(community_id: CommunityId, previous_head: [u8; 32], generation: u64, new_admin: PublicKey) -> Self {
+        Self { community_id, previous_head, generation, new_admin, signatures: vec![] }
+    }
+
+    fn body(&self) -> Vec<u8> {
+        Canon::new("laira/admin-recovery/v1")
+            .field(&self.community_id)
+            .field(&self.previous_head)
+            .u64(self.generation)
+            .field(&self.new_admin.0)
+            .done()
+    }
+
+    /// Chain head after this recovery: hash of the body (signatures excluded,
+    /// so different signer subsets of the same recovery agree on the head).
+    pub fn head(&self) -> [u8; 32] {
+        Sha256::digest(self.body()).into()
+    }
+
+    pub fn sign(&mut self, guardian: &Identity) {
+        let g = guardian.public();
+        if !self.signatures.iter().any(|s| s.guardian == g) {
+            self.signatures.push(GuardianSig { guardian: g, signature: guardian.sign(&self.body()) });
+        }
+    }
+}
+
+/// Verified chain of admin recoveries: answers "who is the admin now?".
+/// A second, different recovery extending the same head is a fork: the chain
+/// freezes (`is_frozen`) and admin changes stop until it is resolved out of
+/// band — nobody is promoted just because the admin is offline.
+pub struct RecoveryChain {
+    genesis: Genesis,
+    admin: PublicKey,
+    head: [u8; 32],
+    generation: u64,
+    frozen: bool,
+}
+
+impl RecoveryChain {
+    pub fn new(genesis: Genesis) -> Result<Self> {
+        genesis.verify()?;
+        Ok(Self { admin: genesis.admin, head: genesis.community_id(), genesis, generation: 0, frozen: false })
+    }
+
+    pub fn admin(&self) -> PublicKey {
+        self.admin
+    }
+    pub fn head(&self) -> [u8; 32] {
+        self.head
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub fn is_frozen(&self) -> bool {
+        self.frozen
+    }
+
+    /// Apply the next recovery. Idempotent for the already-applied one.
+    pub fn apply(&mut self, r: &AdminRecovery) -> Result<()> {
+        if r.community_id != self.genesis.community_id() {
+            return Err(Error::WrongCommunity);
+        }
+        if self.frozen {
+            return Err(Error::RecoveryFork);
+        }
+        if r.head() == self.head {
+            return Ok(()); // already applied
+        }
+        if r.previous_head != self.head || r.generation != self.generation + 1 {
+            // Same generation, different content, extending an older head: fork.
+            if r.generation <= self.generation {
+                self.frozen = true;
+                return Err(Error::RecoveryFork);
+            }
+            return Err(Error::RecoveryOutOfOrder);
+        }
+        let body = r.body();
+        let mut seen = HashSet::new();
+        for s in &r.signatures {
+            if !self.genesis.recovery.contains(&s.guardian) || !seen.insert(s.guardian) {
+                continue; // not a guardian, or a duplicate signer
+            }
+            s.guardian.verify(&body, &s.signature)?;
+        }
+        if seen.len() < self.genesis.recovery_threshold.max(1) as usize {
+            return Err(Error::RecoveryUnderSigned);
+        }
+        self.admin = r.new_admin;
+        self.head = r.head();
+        self.generation = r.generation;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------- session tokens
 
 /// Member's proof-of-possession request for a session token.
@@ -706,14 +970,15 @@ impl SessionToken {
             .field(&self.community_id).field(&self.member.0).u64(self.expires_at).done()
     }
 
-    pub fn verify(&self, genesis: &Genesis, now: u64) -> Result<()> {
-        if self.community_id != genesis.community_id() {
+    pub fn verify(&self, trust: impl Into<Trust>, now: u64) -> Result<()> {
+        let trust = trust.into();
+        if self.community_id != trust.community_id {
             return Err(Error::WrongCommunity);
         }
         if now >= self.expires_at {
             return Err(Error::InviteExpired);
         }
-        genesis.admin.verify(&self.body(), &self.signature)
+        trust.admin.verify(&self.body(), &self.signature)
     }
 }
 
@@ -804,11 +1069,12 @@ impl EpochBundle {
 
     /// Verify against the genesis and open our copy of the epoch secret.
     /// Returns the secret plus the roster (kid -> member).
-    pub fn open(&self, genesis: &Genesis, me: &Identity) -> Result<(EpochSecret, Vec<(u8, PublicKey)>)> {
-        if self.community_id != genesis.community_id() {
+    pub fn open<'a>(&self, trust: impl Into<Trust>, me: &Identity) -> Result<(EpochSecret, Vec<(u8, PublicKey)>)> {
+        let trust = trust.into();
+        if self.community_id != trust.community_id {
             return Err(Error::WrongCommunity);
         }
-        genesis.admin.verify(&self.body(), &self.signature)?;
+        trust.admin.verify(&self.body(), &self.signature)?;
         let mine = self.sealed.iter().find(|(pk, _)| *pk == me.public()).ok_or(Error::NotInRoster)?;
         let secret = unseal(&mine.1, me, &Self::aad(&self.community_id, self.epoch))?;
         Ok((EpochSecret::new(secret, self.epoch), self.roster.clone()))
@@ -828,6 +1094,123 @@ mod tests {
         let rec = vec![Identity::from_seed([2; 32]).public(), Identity::from_seed([3; 32]).public()];
         let g = Genesis::create(&admin, rec, 2, 1000);
         (Authority::new(admin, g.clone()).unwrap(), g)
+    }
+
+    fn guarded() -> (Identity, [Identity; 3], Genesis) {
+        let admin = Identity::from_seed([1; 32]);
+        let g3 = [Identity::from_seed([2; 32]), Identity::from_seed([3; 32]), Identity::from_seed([4; 32])];
+        let g = Genesis::create(&admin, g3.iter().map(|i| i.public()).collect(), 2, 1000);
+        (admin, g3, g)
+    }
+
+    #[test]
+    fn recovery_needs_two_of_three_guardians() {
+        let (_, gs, g) = guarded();
+        let mut chain = RecoveryChain::new(g.clone()).unwrap();
+        let new_admin = Identity::from_seed([9; 32]).public();
+        let mut r = AdminRecovery::propose(g.community_id(), chain.head(), 1, new_admin);
+        r.sign(&gs[0]);
+        assert_eq!(chain.apply(&r), Err(Error::RecoveryUnderSigned));
+        r.sign(&gs[0]); // same guardian twice still counts once
+        assert_eq!(chain.apply(&r), Err(Error::RecoveryUnderSigned));
+        // a non-guardian signature doesn't count
+        r.sign(&Identity::from_seed([77; 32]));
+        assert_eq!(chain.apply(&r), Err(Error::RecoveryUnderSigned));
+        r.sign(&gs[2]);
+        chain.apply(&r).unwrap();
+        assert_eq!(chain.admin(), new_admin);
+        assert_eq!(chain.generation(), 1);
+        chain.apply(&r).unwrap(); // idempotent
+    }
+
+    #[test]
+    fn recovery_forged_signature_and_order() {
+        let (_, gs, g) = guarded();
+        let mut chain = RecoveryChain::new(g.clone()).unwrap();
+        let mut r = AdminRecovery::propose(g.community_id(), chain.head(), 1, Identity::from_seed([9; 32]).public());
+        r.sign(&gs[0]);
+        r.sign(&gs[1]);
+        // tamper with the new admin after signing
+        let mut bad = r.clone();
+        bad.new_admin = Identity::from_seed([8; 32]).public();
+        assert_eq!(chain.apply(&bad), Err(Error::BadSignature));
+        // skipping a generation is out of order
+        let mut skip = AdminRecovery::propose(g.community_id(), chain.head(), 2, r.new_admin);
+        skip.sign(&gs[0]);
+        skip.sign(&gs[1]);
+        assert_eq!(chain.apply(&skip), Err(Error::RecoveryOutOfOrder));
+    }
+
+    #[test]
+    fn full_admin_recovery_flow() {
+        let (old_admin, gs, g) = guarded();
+        let mut auth = Authority::new(Identity::from_seed(old_admin.seed()), g.clone()).unwrap();
+        let b = auth.create_invite(1000, 600, 2, Role::Member);
+        let alice = Identity::generate();
+        auth.admit(&JoinRequest::new(&alice, &b), 1001).unwrap();
+        let e_old = auth.new_epoch().unwrap();
+        let (secret_old, _) = e_old.open(&g, &alice).unwrap();
+
+        // the admin device is lost: two guardians name a new admin
+        let new_admin = Identity::from_seed([42; 32]);
+        let mut r = AdminRecovery::propose(g.community_id(), auth.recovery_head(), 1, new_admin.public());
+        r.sign(&gs[0]);
+        r.sign(&gs[1]);
+        // a fresh authority for the new admin, restored from the old state
+        let snap = serde_json::to_string(&auth.snapshot()).unwrap();
+        let mut old_view: Authority = Authority::restore(Identity::from_seed(old_admin.seed()), serde_json::from_str(&snap).unwrap()).unwrap();
+        // the old admin's authority no longer signs once it learns of the recovery
+        assert_eq!(old_view.apply_recovery(&r, None).unwrap().is_none(), true);
+        assert_eq!(old_view.new_epoch().err(), Some(Error::NotAdmin));
+
+        let mut fresh: Authority = {
+            // new admin takes over the persisted state (old key can't restore it)
+            let mut snap: AuthoritySnapshot = serde_json::from_str(&snap).unwrap();
+            snap.recoveries.clear();
+            let mut a = Authority::restore(Identity::from_seed(old_admin.seed()), snap).unwrap();
+            let epoch = a.apply_recovery(&r, Some(Identity::from_seed(new_admin.seed()))).unwrap().unwrap();
+            assert!(a.is_member(&alice.public()));
+            assert!(!a.is_member(&old_admin.public()));
+            assert_eq!(epoch.epoch, e_old.epoch + 1);
+            a
+        };
+        let trust = fresh.trust();
+        assert_eq!(trust.admin, new_admin.public());
+        let e_new = fresh.latest_epoch().unwrap().clone();
+        // alice opens the new epoch only with the recovered trust anchor
+        assert!(e_new.open(&g, &alice).is_err());
+        let (secret_new, roster) = e_new.open(&trust, &alice).unwrap();
+        assert_ne!(secret_new.sframe_base_key(0), secret_old.sframe_base_key(0));
+        assert!(roster.iter().all(|(_, pk)| *pk != old_admin.public()));
+        // the old admin can't open the new epoch (not in roster)
+        assert_eq!(e_new.open(&trust, &old_admin).err(), Some(Error::NotInRoster));
+        // old admin's signed objects are not trusted any more
+        assert!(e_old.open(&trust, &alice).is_err());
+        // tokens are issued by the new admin and verify against the new trust only
+        let t = fresh.issue_token(&TokenRequest::new(&alice, g.community_id(), 1100), 1100).unwrap();
+        t.verify(&trust, 1101).unwrap();
+        assert!(t.verify(&g, 1101).is_err());
+        // state survives a restart of the recovered authority
+        let again = Authority::restore(Identity::from_seed(new_admin.seed()), serde_json::from_str(&serde_json::to_string(&fresh.snapshot()).unwrap()).unwrap()).unwrap();
+        assert_eq!(again.trust(), trust);
+    }
+
+    #[test]
+    fn conflicting_recoveries_freeze_the_chain() {
+        let (_, gs, g) = guarded();
+        let mut chain = RecoveryChain::new(g.clone()).unwrap();
+        let head0 = chain.head();
+        let mut a = AdminRecovery::propose(g.community_id(), head0, 1, Identity::from_seed([9; 32]).public());
+        a.sign(&gs[0]); a.sign(&gs[1]);
+        let mut b = AdminRecovery::propose(g.community_id(), head0, 1, Identity::from_seed([10; 32]).public());
+        b.sign(&gs[1]); b.sign(&gs[2]);
+        chain.apply(&a).unwrap();
+        assert_eq!(chain.apply(&b), Err(Error::RecoveryFork));
+        assert!(chain.is_frozen());
+        // frozen: even a valid next recovery is refused until resolved out of band
+        let mut c = AdminRecovery::propose(g.community_id(), a.head(), 2, Identity::from_seed([11; 32]).public());
+        c.sign(&gs[0]); c.sign(&gs[1]);
+        assert_eq!(chain.apply(&c), Err(Error::RecoveryFork));
     }
 
     #[test]

@@ -10,7 +10,8 @@ import { resolve, extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import * as mediasoup from 'mediasoup';
-import { createPublicKey, verify as edVerify } from 'node:crypto';
+import { verify as edVerify } from 'node:crypto';
+import { canon, u64, pubKey, verifyGenesis, trustFromChain } from './chain.mjs';
 
 const env = process.env;
 const config = {
@@ -24,6 +25,9 @@ const config = {
   // admin-signed session token from services/control; unset = open (M0 dev).
   adminKey: env.LAIRA_ADMIN_KEY || '',
   communityId: env.LAIRA_COMMUNITY_ID || '',
+  // Optional: follow guardian-signed admin recoveries published here. The
+  // pinned community id above still anchors trust; the URL only supplies data.
+  controlUrl: env.LAIRA_CONTROL_URL || '',
   tlsCert: env.LAIRA_TLS_CERT || '',
   tlsKey: env.LAIRA_TLS_KEY || '',
   staticDir: env.LAIRA_STATIC_DIR ||
@@ -51,20 +55,31 @@ const mediaCodecs = [
 ];
 
 const authEnabled = !!(config.adminKey && config.communityId);
-const SPKI_ED25519 = Buffer.from('302a300506032b6570032100', 'hex');
-const adminPub = authEnabled
-  ? createPublicKey({ key: Buffer.concat([SPKI_ED25519, Buffer.from(config.adminKey, 'hex')]), format: 'der', type: 'spki' })
-  : null;
+let adminPub = authEnabled ? pubKey(config.adminKey) : null;
 
-// Canonical encoding shared with crates/identity (`Canon`): u32-BE length
-// prefix per field, first field is the domain label.
-function canon(domain, ...fields) {
-  const parts = [domain, ...fields].map((f) => Buffer.isBuffer(f) ? f : Buffer.from(f));
-  return Buffer.concat(parts.flatMap((b) => {
-    const len = Buffer.alloc(4); len.writeUInt32BE(b.length); return [len, b];
-  }));
+// Follow the recovery chain: the pinned community id anchors it; the control
+// service only supplies the genesis and recoveries, which we verify.
+async function refreshTrust() {
+  const j = async (path) => {
+    const r = await fetch(`${config.controlUrl}${path}`);
+    if (!r.ok) throw new Error(`${path}: ${r.status}`);
+    return r.json();
+  };
+  const genesis = await j('/v1/genesis');
+  if (verifyGenesis(genesis) !== config.communityId) throw new Error('control genesis does not match pinned community id');
+  const trust = trustFromChain(genesis, await j('/v1/recoveries'));
+  if (trust.admin !== config.adminKey) {
+    console.log(`admin recovered: now trusting ${trust.admin.slice(0, 8)}…`);
+    config.adminKey = trust.admin;
+    adminPub = pubKey(trust.admin);
+  }
 }
-function u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; }
+if (authEnabled && config.controlUrl) {
+  const tick = () => refreshTrust().catch((e) => console.error('trust refresh failed:', e.message));
+  tick();
+  setInterval(tick, 10000).unref();
+}
+
 function tokenBody(t) {
   return canon('laira/session-token/v1', Buffer.from(t.community_id, 'hex'), Buffer.from(t.member, 'hex'), u64(t.expires_at));
 }

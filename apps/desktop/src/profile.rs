@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use laira_identity::{
-    EpochBundle, EpochSecret, Genesis, Identity, InviteBundle, JoinRequest, MembershipCert,
+    AdminRecovery, RecoveryChain, Trust, EpochBundle, EpochSecret, Genesis, Identity, InviteBundle, JoinRequest, MembershipCert,
     PublicKey, SessionToken, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -76,7 +76,8 @@ impl Profile {
         #[derive(Deserialize)]
         struct Reply { cert: MembershipCert, epoch: EpochBundle }
         let reply: Reply = serde_json::from_str(&text)?;
-        reply.epoch.open(&genesis, &me).context("epoch bundle did not open")?;
+        let trust = trust_from(&http, control, &genesis).await?;
+        reply.epoch.open(&trust, &me).context("epoch bundle did not open")?;
         let p = Profile { seed: hex::encode(me.seed()), control: control.into(), genesis, cert: Some(reply.cert) };
         p.save()?;
         Ok(p)
@@ -93,15 +94,22 @@ impl Profile {
         let genesis: Genesis = get_json(&http, &format!("{control}/v1/genesis")).await?;
         genesis.verify()?;
         let p = Profile { seed: a.seed, control: control.into(), genesis, cert: None };
-        anyhow::ensure!(p.identity()?.public() == p.genesis.admin, "admin.json does not match community");
+        anyhow::ensure!(p.identity()?.public() == p.trust().await?.admin, "admin.json is not the community's current admin");
         p.save()?;
         Ok(p)
+    }
+
+    /// The current admin per the guardian-signed recovery chain (verified
+    /// against the genesis, never taken on the control service's word).
+    pub async fn trust(&self) -> Result<Trust> {
+        trust_from(&reqwest::Client::new(), &self.control, &self.genesis).await
     }
 
     pub async fn latest_epoch(&self) -> Result<(EpochSecret, EpochBundle)> {
         let http = reqwest::Client::new();
         let b: EpochBundle = get_json(&http, &format!("{}/v1/epoch/latest", self.control)).await?;
-        let (secret, _) = b.open(&self.genesis, &self.identity()?)
+        let trust = self.trust().await?;
+        let (secret, _) = b.open(&trust, &self.identity()?)
             .context("cannot open current epoch (revoked or not in roster?)")?;
         Ok((secret, b))
     }
@@ -119,6 +127,15 @@ impl Profile {
     pub fn public(&self) -> Result<PublicKey> {
         Ok(self.identity()?.public())
     }
+}
+
+async fn trust_from(http: &reqwest::Client, control: &str, genesis: &Genesis) -> Result<Trust> {
+    let recs: Vec<AdminRecovery> = get_json(http, &format!("{control}/v1/recoveries")).await?;
+    let mut chain = RecoveryChain::new(genesis.clone())?;
+    for r in &recs {
+        chain.apply(r).context("control service returned an invalid recovery chain")?;
+    }
+    Ok(Trust::from(&chain))
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(http: &reqwest::Client, url: &str) -> Result<T> {

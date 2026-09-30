@@ -12,7 +12,7 @@ $CTL serve --dir $W/ctl --bind 127.0.0.1:4599 >$W/ctl.log 2>&1 &
 sleep 3
 LAIRA_HOME=$W/A $D adopt-admin --control http://127.0.0.1:4599 --dir $W/ctl >/dev/null
 LAIRA_HOME=$W/A $D test-video ${E2EE_FLAG---e2ee} --seconds ${STREAM_SECS:-40} >$W/tv.log 2>&1 &
-LAIRA_HOME=$W/A $D test-audio --e2ee --seconds ${STREAM_SECS:-40} >$W/ta.log 2>&1 &
+[ -n "${NO_AUDIO:-}" ] || LAIRA_HOME=$W/A $D test-audio --e2ee --seconds ${STREAM_SECS:-40} >$W/ta.log 2>&1 &
 sleep 2
 LINK=$($CTL invite --dir $W/ctl --url http://127.0.0.1:4599 --web http://127.0.0.1:4443)
 echo "$W"

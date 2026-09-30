@@ -71,8 +71,8 @@ function getWorker(): Worker {
       if (e.data?.sframeFormat) log(e.data.sframeFormat);
       const s = e.data?.sframe;
       if (s) {
-        log(`sframe: ${s.ok} ok / ${s.dropped} dropped${s.firstErr ? ' err=' + s.firstErr : ''}`);
-        (window as any).__sframeStats = s;
+        log(`sframe ${s.kind}: ${s.ok} ok / ${s.dropped} dropped${s.firstErr ? ' first=' + s.firstErr : ''}${s.lastErr ? ' last=' + s.lastErr : ''}`);
+        ((window as any).__sframeStats ??= {})[s.kind] = s;
       }
     };
   }

@@ -159,7 +159,7 @@ ffplay) renders the desktop correctly.
 Implemented: identities, signed genesis, invites, admission, revocation,
 sealed epoch distribution with KID↔identity binding (`crates/identity`), the
 control service (`services/control`), session tokens verified by the SFU, live
-rekey on epoch change, browser join. Not implemented: OpenMLS (the admin is the
-single key controller), 2-of-3 admin recovery, dead-drop/mailbox discovery
+rekey on epoch change, browser join. Also implemented: 2-of-3 admin recovery (`RecoveryChain`, control CLI, JS/Rust/SFU verification), 8-byte SFrame counters with a random per-sender prefix (two processes of one member share a KID and key, so counters starting at 0 reused AES-GCM nonces). Not implemented: OpenMLS (the admin is the
+single key controller), dead-drop/mailbox discovery
 (the mailbox endpoint exists but nothing uses it yet), audio in the native
 `stream` command has only been exercised through `test-audio`.

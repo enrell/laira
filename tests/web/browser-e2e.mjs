@@ -19,8 +19,11 @@ await page.waitForFunction(() => !document.getElementById('watch').disabled, { t
 await page.click('#watch');
 await new Promise((r) => setTimeout(r, secs * 1000));
 const res = await page.evaluate(async () => {
-  const v = document.querySelector('video');
-  const out = { hasVideo: !!v, w: v?.videoWidth ?? 0, h: v?.videoHeight ?? 0, stats: document.querySelector('.stats')?.textContent ?? '', sframe: window.__sframeStats ?? null };
+  // Audio and video may come from different peers (separate boxes): look at all.
+  const vids = [...document.querySelectorAll('video')];
+  const v = vids.sort((a, b) => b.videoWidth - a.videoWidth)[0];
+  const stats = [...document.querySelectorAll('.stats')].map((e) => e.textContent).find((t) => t) ?? '';
+  const out = { hasVideo: !!v, w: v?.videoWidth ?? 0, h: v?.videoHeight ?? 0, stats, sframe: window.__sframeStats ?? null };
   return out;
 });
 const dbg = await page.evaluate(async () => {
@@ -46,7 +49,7 @@ const audio = await page.evaluate(async () => {
 console.log('AUDIO', JSON.stringify(audio));
 console.log('DBG', JSON.stringify(dbg));
 console.log(JSON.stringify(res));
-console.log(logs.slice(-15).join('\n'));
+console.log(logs.filter((l) => !/^sframe (video|audio):/.test(l)).slice(-25).join('\n'));
 await browser.close();
 const audioOk = audio.some((a) => a.energy > 0.01);
 if (!audioOk) console.error('AUDIO NOT DECODED');

@@ -46,9 +46,14 @@ surprises.
   the single controller that generates and seals each epoch secret, so a
   compromised admin key or control service compromises the community. Moving
   to OpenMLS is planned.
-- **Admin recovery is not implemented.** The genesis records recovery
-  guardians, but nothing executes a recovery. Losing the admin key loses the
-  community.
+- **Admin recovery trusts the guardians.** A community created with
+  `--guardian` keys can replace a lost admin with a threshold (default 2-of-3)
+  of guardian signatures; members, browsers and the SFU verify the chain against
+  the genesis. This is not Byzantine consensus: colluding guardians can take
+  over the community, and conflicting recoveries freeze the chain until
+  resolved out of band. Guardians must persist what they signed and never sign
+  two recoveries extending the same head. A community created without
+  guardians has **no recovery**: losing `admin.json` loses it.
 - **Revocation is not instantaneous.** A removed member keeps the old epoch
   secret they already hold (forward secrecy for *future* media only), and an
   existing SFU connection lasts until its session token expires (5 minutes).
@@ -65,8 +70,10 @@ surprises.
   HTTP/WebSocket unless you put TLS in front. The control service's mailbox is
   unauthenticated and only bounded by size/TTL limits. Run it on localhost or
   behind TLS; do not expose the admin token.
-- **The SFrame counter is 32-bit and the key ID is 3 bits**, which limits a
-  domain to 8 senders and requires re-keying before 2^32 frames.
+- **SFrame limits.** The key ID is 3 bits, so a domain has at most 8 members.
+  Each sender uses a 64-bit counter (random 32-bit prefix per process/tab so
+  a member's several senders never share a nonce space, plus a 32-bit frame
+  counter) and must re-key before 2^32 frames.
 - **Test-vector fallback.** If no community profile or `LAIRA_EPOCH_SECRET` is
   configured, the desktop client falls back to a *public* test key and prints
   a warning. That mode provides no confidentiality.

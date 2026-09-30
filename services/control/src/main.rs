@@ -23,7 +23,7 @@ use axum::{
 };
 use clap::{Parser, Subcommand};
 use laira_identity::{
-    Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
+    AdminRecovery, Authority, AuthoritySnapshot, EpochBundle, Genesis, Identity, InviteBundle, JoinRequest,
     MembershipCert, PublicKey, Revocation, Role, SessionToken, TokenRequest,
 };
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,42 @@ enum Cmd {
     Init {
         #[arg(long)]
         dir: PathBuf,
+        /// Recovery guardian public keys (hex). Repeat; see `keygen`.
+        #[arg(long = "guardian")]
+        guardians: Vec<String>,
+        /// Guardian signatures required to replace the admin (default 2 when
+        /// three or more guardians are given, else all of them).
+        #[arg(long)]
+        threshold: Option<u8>,
+    },
+    /// Generate an identity file (guardian or new admin). Prints the public key.
+    Keygen {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Propose replacing the admin; prints a recovery JSON for guardians to sign.
+    RecoveryPropose {
+        #[arg(long)]
+        dir: PathBuf,
+        /// Hex public key of the new admin.
+        #[arg(long)]
+        new_admin: String,
+    },
+    /// Add a guardian signature to a recovery JSON file (in place).
+    RecoverySign {
+        #[arg(long)]
+        guardian_key: PathBuf,
+        recovery: PathBuf,
+    },
+    /// Apply a fully signed recovery to a *stopped* control dir, becoming the
+    /// new admin: replaces admin.json with the new identity, re-signs
+    /// memberships and issues a fresh epoch.
+    Recover {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        new_admin_key: PathBuf,
+        recovery: PathBuf,
     },
     /// Serve the control API.
     Serve {
@@ -75,6 +111,16 @@ enum Cmd {
         url: String,
         member: String,
     },
+}
+
+fn parse_pub(h: &str) -> Result<PublicKey> {
+    Ok(PublicKey(hex::decode(h.trim())?.try_into().map_err(|_| anyhow::anyhow!("public key must be 64 hex chars"))?))
+}
+
+fn load_key_file(path: &Path) -> Result<Identity> {
+    let f: AdminFile = serde_json::from_slice(&std::fs::read(path).with_context(|| path.display().to_string())?)?;
+    let seed: [u8; 32] = hex::decode(f.seed)?.try_into().map_err(|_| anyhow::anyhow!("bad seed"))?;
+    Ok(Identity::from_seed(seed))
 }
 
 fn now() -> u64 {
@@ -118,20 +164,27 @@ fn load_identity(dir: &Path) -> Result<Identity> {
     Ok(Identity::from_seed(seed))
 }
 
-fn init(dir: &Path) -> Result<()> {
+fn init(dir: &Path, guardians: Vec<String>, threshold: Option<u8>) -> Result<()> {
     anyhow::ensure!(!dir.join("admin.json").exists(), "already initialized");
     std::fs::create_dir_all(dir)?;
     let id = Identity::generate();
     write_secret(&dir.join("admin.json"), &serde_json::to_string(&AdminFile { seed: hex::encode(id.seed()) })?)?;
     write_secret(&dir.join("admin.token"), &hex::encode(rand::random::<[u8; 24]>()))?;
-    let genesis = Genesis::create(&id, vec![], 0, now());
+    let guardians: Vec<PublicKey> = guardians.iter().map(|g| parse_pub(g)).collect::<Result<_>>()?;
+    let threshold = threshold.unwrap_or(if guardians.len() >= 3 { 2 } else { guardians.len() as u8 });
+    anyhow::ensure!(guardians.is_empty() || (threshold >= 1 && threshold as usize <= guardians.len()), "bad threshold");
+    let genesis = Genesis::create(&id, guardians.clone(), threshold, now());
     let mut auth = Authority::new(id, genesis.clone())?;
     auth.new_epoch()?; // epoch 1: admin only
     let inner = Inner { auth, dir: dir.to_path_buf(), mailbox: HashMap::new(), admin_token: String::new() };
     inner.persist()?;
     println!("community_id = {}", hex::encode(genesis.community_id()));
     println!("admin_key    = {}", hex::encode(genesis.admin.0));
-    println!("note: no recovery guardians configured (PLAN §11) — losing admin.json loses the community");
+    if guardians.is_empty() {
+        println!("note: no recovery guardians configured (PLAN §11) — losing admin.json loses the community");
+    } else {
+        println!("recovery    = {}-of-{} guardians", threshold, guardians.len());
+    }
     Ok(())
 }
 
@@ -173,6 +226,10 @@ async fn join(State(s): State<Shared>, Json(req): Json<JoinRequest>) -> Result<J
     };
     st.persist().map_err(err(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(JoinReply { cert, epoch }))
+}
+
+async fn recoveries(State(s): State<Shared>) -> Json<Vec<AdminRecovery>> {
+    Json(lock(&s).auth.recoveries().to_vec())
 }
 
 async fn latest_epoch(State(s): State<Shared>) -> Result<Json<EpochBundle>, ApiErr> {
@@ -259,6 +316,7 @@ fn router(shared: Shared) -> Router {
     Router::new()
         .route("/v1/genesis", get(genesis))
         .route("/v1/join", post(join))
+        .route("/v1/recoveries", get(recoveries))
         .route("/v1/epoch/latest", get(latest_epoch))
         .route("/v1/token", post(token))
         .route("/v1/admin/invite", post(admin_invite))
@@ -289,7 +347,40 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())).init();
     match Cli::parse().cmd {
-        Cmd::Init { dir } => init(&dir),
+        Cmd::Init { dir, guardians, threshold } => init(&dir, guardians, threshold),
+        Cmd::Keygen { out } => {
+            let id = Identity::generate();
+            write_secret(&out, &serde_json::to_string(&AdminFile { seed: hex::encode(id.seed()) })?)?;
+            println!("{}", hex::encode(id.public().0));
+            Ok(())
+        }
+        Cmd::RecoveryPropose { dir, new_admin } => {
+            let snap: AuthoritySnapshot = serde_json::from_slice(&std::fs::read(dir.join("state.json"))?)?;
+            let (head, generation) = snap.recovery_state()?;
+            let r = AdminRecovery::propose(snap.community_id(), head, generation + 1, parse_pub(&new_admin)?);
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
+        Cmd::RecoverySign { guardian_key, recovery } => {
+            let g = load_key_file(&guardian_key)?;
+            let mut r: AdminRecovery = serde_json::from_slice(&std::fs::read(&recovery)?)?;
+            r.sign(&g);
+            std::fs::write(&recovery, serde_json::to_vec_pretty(&r)?)?;
+            println!("signed by {} ({} signature(s) so far)", hex::encode(g.public().0), r.signatures.len());
+            Ok(())
+        }
+        Cmd::Recover { dir, new_admin_key, recovery } => {
+            let snap: AuthoritySnapshot = serde_json::from_slice(&std::fs::read(dir.join("state.json"))?)?;
+            let r: AdminRecovery = serde_json::from_slice(&std::fs::read(&recovery)?)?;
+            let new_id = load_key_file(&new_admin_key)?;
+            let seed = new_id.seed();
+            let (auth, epoch) = Authority::recover_from(snap, &r, new_id)?;
+            write_secret(&dir.join("admin.json"), &serde_json::to_string(&AdminFile { seed: hex::encode(seed) })?)?;
+            Inner { auth, dir: dir.clone(), mailbox: HashMap::new(), admin_token: String::new() }.persist()?;
+            let epoch = Some(epoch);
+            println!("recovered: new admin active{}", epoch.map(|e| format!(", epoch {}", e.epoch)).unwrap_or_default());
+            Ok(())
+        }
         Cmd::Serve { dir, bind } => {
             let snap: AuthoritySnapshot = serde_json::from_slice(&std::fs::read(dir.join("state.json")).context("run init first")?)?;
             let auth = Authority::restore(load_identity(&dir)?, snap)?;

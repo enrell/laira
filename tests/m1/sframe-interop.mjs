@@ -34,10 +34,10 @@ if (!PREFIX.every((x, i) => body[i] === x) || body[body.length - 1] !== 0x80) { 
 const blob = body.slice(PREFIX.length, body.length - 1); // same as sframe-worker.ts blobPayload
 const cfg = blob[0];
 const ctrLen = (cfg & 0x0f) + 1;
-let ctr = 0;
-for (let i = 0; i < ctrLen; i++) ctr = ctr * 256 + blob[1 + i];
+let ctr = 0n;
+for (let i = 0; i < ctrLen; i++) ctr = (ctr << 8n) | BigInt(blob[1 + i]);
 const nonce = new Uint8Array(salt);
-let c = BigInt(ctr);
+let c = ctr;
 for (let i = 11; i >= 4 && c > 0n; i--) { nonce[i] ^= Number(c & 0xffn); c >>= 8n; }
 
 const pt = new Uint8Array(await crypto.subtle.decrypt(

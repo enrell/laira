@@ -3,7 +3,7 @@
 // senders. Mirrors crates/media/src/sframe.rs exactly:
 //   key  = HKDF-SHA256(base, salt="SFrame 1.0", info="key")  -> 16B
 //   salt = HKDF-SHA256(base, salt="SFrame 1.0", info="salt") -> 12B
-//   wire = cfg((kid<<4)|3) || ctr4BE || ct || tag(16)
+//   wire = cfg((kid<<4)|7) || ctr8BE || ct || tag(16)
 //   nonce = salt XOR ctr12 ; aad = header bytes
 //
 // Keys: per-sender, derived from the community epoch (see laira.ts).
@@ -18,7 +18,10 @@ let current = new Map<number, Ctx>();
 let previous = new Map<number, Ctx>();
 let sendKid = 0;
 let sendCtx: Ctx | undefined;
-const sendCtr = { c: 0 };
+// 8-byte counter: random 32-bit prefix (nonce space per tab/device, since
+// every tab of a member shares one KID and key) + 32-bit frame counter.
+const freshCtr = () => BigInt(crypto.getRandomValues(new Uint32Array(1))[0]) << 32n;
+const sendCtr = { c: freshCtr() };
 
 async function derive(baseKey: Uint8Array): Promise<Ctx> {
   const ikm = await crypto.subtle.importKey('raw', baseKey as BufferSource, 'HKDF', false, ['deriveBits']);
@@ -48,7 +51,7 @@ self.addEventListener('message', async (e: MessageEvent) => {
     current = next;
     sendKid = m.kid;
     sendCtx = next.get(m.kid);
-    sendCtr.c = 0; // new key, fresh counter
+    sendCtr.c = freshCtr(); // new key, fresh nonce space
   } else if (m?.type === 'forget-previous') {
     previous = new Map();
   }
@@ -111,8 +114,8 @@ async function decryptAudio(frame: RTCEncodedAudioFrame) {
   const blob = new Uint8Array(frame.data);
   const cfg = blob[0];
   const ctrLen = (cfg & 0x0f) + 1;
-  let ctr = 0;
-  for (let i = 0; i < ctrLen; i++) ctr = ctr * 256 + blob[1 + i];
+  let ctr = 0n;
+  for (let i = 0; i < ctrLen; i++) ctr = (ctr << 8n) | BigInt(blob[1 + i]);
   const kid = (cfg >> 4) & 0x07;
   const aad = blob.slice(0, 1 + ctrLen);
   const attempt = (ctx: Ctx | undefined) => {
@@ -149,8 +152,8 @@ async function decryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame) 
     if (!blob) continue; // real SPS/PPS ahead of the blob: the plaintext AU repeats them
     const cfg = blob[0];
     const ctrLen = (cfg & 0x0f) + 1;
-    let ctr = 0;
-    for (let i = 0; i < ctrLen; i++) ctr = ctr * 256 + blob[1 + i];
+    let ctr = 0n;
+    for (let i = 0; i < ctrLen; i++) ctr = (ctr << 8n) | BigInt(blob[1 + i]);
     const kid = (cfg >> 4) & 0x07;
     const aad = blob.slice(0, 1 + ctrLen);
     const attempt = async (ctx: Ctx | undefined) => {
@@ -181,9 +184,10 @@ async function encryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame) 
   if (!sendCtx) throw new Error('no send key');
   const data = new Uint8Array(frame.data);
   const ctr = sendCtr.c++;
-  const header = new Uint8Array(1 + 4);
-  header[0] = (sendKid << 4) | 0x03;
-  new DataView(header.buffer).setUint32(1, ctr >>> 0);
+  if ((ctr & 0xffffffffn) === 0xffffffffn) throw new Error('sframe counter exhausted; rekey required');
+  const header = new Uint8Array(1 + 8);
+  header[0] = (sendKid << 4) | 0x07;
+  new DataView(header.buffer).setBigUint64(1, ctr);
   const ct = new Uint8Array(await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: nonceFor(sendCtx.salt, ctr) as BufferSource, additionalData: header as BufferSource, tagLength: 128 },
     sendCtx.key, data as BufferSource));
@@ -194,9 +198,11 @@ async function encryptFrame(frame: RTCEncodedVideoFrame | RTCEncodedAudioFrame) 
 }
 
 // The transform runs in a dedicated worker context (RTCRtpScriptTransform).
-const stats = { ok: 0, dropped: 0, firstErr: '' };
+const stats: Record<string, { ok: number; dropped: number; firstErr: string; lastErr?: string }> = {
+  video: { ok: 0, dropped: 0, firstErr: '' }, audio: { ok: 0, dropped: 0, firstErr: '' },
+};
 setInterval(() => {
-  if (stats.ok || stats.dropped) (self as any).postMessage({ sframe: stats });
+  for (const [k, st] of Object.entries(stats)) if (st.ok || st.dropped) (self as any).postMessage({ sframe: { kind: k, ...st } });
 }, 2000);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -211,11 +217,12 @@ setInterval(() => {
           if (mode === 'encrypt') controller.enqueue(await encryptFrame(frame));
           else if (kind === 'audio') controller.enqueue(await decryptAudio(frame as RTCEncodedAudioFrame));
           else controller.enqueue(await decryptFrame(frame));
-          stats.ok++;
+          stats[kind].ok++;
         } catch (e) {
           // Drop undecryptable frames — wrong key or non-SFrame sender.
-          stats.dropped++;
-          if (!stats.firstErr) stats.firstErr = String(e);
+          stats[kind].dropped++;
+          stats[kind].lastErr = String(e);
+          if (!stats[kind].firstErr) stats[kind].firstErr = String(e);
         }
       },
     }))

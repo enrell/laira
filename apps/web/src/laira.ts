@@ -32,6 +32,40 @@ function canon(domain: string, ...fields: Uint8Array[]): Uint8Array {
 export interface Genesis {
   admin: string; recovery: string[]; recovery_threshold: number; created_at: number; signature: string;
 }
+export interface AdminRecovery {
+  community_id: string; previous_head: string; generation: number; new_admin: string;
+  signatures: { guardian: string; signature: string }[];
+}
+export interface Trust { communityId: string; admin: string }
+
+function recoveryBody(r: AdminRecovery): Uint8Array {
+  return canon('laira/admin-recovery/v1', unhex(r.community_id), unhex(r.previous_head), u64(r.generation), unhex(r.new_admin));
+}
+
+/** Guardian-signed chain of admin replacements; mirrors RecoveryChain in Rust. */
+export function trustFromChain(g: Genesis, recoveries: AdminRecovery[]): Trust {
+  const communityId = verifyGenesis(g);
+  let admin = g.admin, head = communityId, generation = 0;
+  for (const r of recoveries) {
+    if (r.community_id !== communityId) throw new Error('recovery for a different community');
+    const body = recoveryBody(r);
+    const rHead = hex(sha256(body));
+    if (rHead === head) continue; // already applied
+    if (r.previous_head !== head || r.generation !== generation + 1) {
+      throw new Error(r.generation <= generation ? 'conflicting recoveries: chain frozen' : 'recovery out of order');
+    }
+    const seen = new Set<string>();
+    for (const s of r.signatures) {
+      if (!g.recovery.includes(s.guardian) || seen.has(s.guardian)) continue;
+      if (!ed25519.verify(unhex(s.signature), body, unhex(s.guardian))) throw new Error('recovery signature invalid');
+      seen.add(s.guardian);
+    }
+    if (seen.size < Math.max(1, g.recovery_threshold)) throw new Error('recovery has too few guardian signatures');
+    admin = r.new_admin; head = rHead; generation = r.generation;
+  }
+  return { communityId, admin };
+}
+
 export interface EpochBundle {
   community_id: string; epoch: number;
   roster: [number, string][];
@@ -108,9 +142,15 @@ export class Member {
   }
 
   /** Verify the admin signature, unseal our copy, return the epoch keys. */
-  async openEpoch(b: EpochBundle): Promise<EpochKeys> {
+  async trust(): Promise<Trust> {
+    const recs: AdminRecovery[] = await Member.http(`${this.control}/v1/recoveries`);
+    return trustFromChain(this.genesis, recs);
+  }
+
+  async openEpoch(b: EpochBundle, trust?: Trust): Promise<EpochKeys> {
+    const t = trust ?? await this.trust();
     if (b.community_id !== this.communityId) throw new Error('epoch for a different community');
-    if (!ed25519.verify(unhex(b.signature), epochBody(b), unhex(this.genesis.admin))) throw new Error('epoch signature invalid');
+    if (!ed25519.verify(unhex(b.signature), epochBody(b), unhex(t.admin))) throw new Error('epoch signature invalid');
     const mine = b.sealed.find(([pk]) => pk === this.pubHex);
     if (!mine) throw new Error('cannot open epoch: not in roster');
     const [, s] = mine;
